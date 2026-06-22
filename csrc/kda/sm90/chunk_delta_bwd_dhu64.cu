@@ -79,6 +79,11 @@ pack_bf16x2(float lo, float hi) {
     return out;
 }
 
+__device__ __forceinline__ uint32_t
+pack_bf16x2_raw(Element lo, Element hi) {
+    return uint32_t(lo.raw()) | (uint32_t(hi.raw()) << 16);
+}
+
 __device__ __forceinline__ void
 store_bridge_64x32_bf16(
     int tidx,
@@ -173,6 +178,44 @@ store_acc_64x32_bf16(int tid, Element* smem_store, Element* gmem, uint32_t row_s
     uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_store));
     store_bridge_64x32_bf16(
         tid, smem_addr, reinterpret_cast<uint64_t>(gmem), row_stride_bytes, p0, p1, p2, p3, p4, p5, p6, p7);
+}
+
+template <typename Bf16Frag>
+CUTE_DEVICE void
+store_bf16frag_64x32(int tid, Element* smem_store, Element* gmem, uint32_t row_stride_bytes, Bf16Frag const& bf16) {
+    uint32_t p0 = pack_bf16x2_raw(bf16(0), bf16(1));
+    uint32_t p1 = pack_bf16x2_raw(bf16(2), bf16(3));
+    uint32_t p2 = pack_bf16x2_raw(bf16(4), bf16(5));
+    uint32_t p3 = pack_bf16x2_raw(bf16(6), bf16(7));
+    uint32_t p4 = pack_bf16x2_raw(bf16(8), bf16(9));
+    uint32_t p5 = pack_bf16x2_raw(bf16(10), bf16(11));
+    uint32_t p6 = pack_bf16x2_raw(bf16(12), bf16(13));
+    uint32_t p7 = pack_bf16x2_raw(bf16(14), bf16(15));
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_store));
+    store_bridge_64x32_bf16(
+        tid, smem_addr, reinterpret_cast<uint64_t>(gmem), row_stride_bytes, p0, p1, p2, p3, p4, p5, p6, p7);
+}
+
+template <typename TiledMma, typename TiledCopy, typename ThrCopy, typename AccFrag, typename STile>
+CUTE_DEVICE void
+r2s_acc_store(
+    TiledMma const& tiled_mma,
+    TiledCopy const& r2s,
+    ThrCopy const& r2s_thr,
+    AccFrag const& acc,
+    STile const& sTile,
+    int tid,
+    Element* smem_store,
+    Element* gmem,
+    uint32_t row_stride_bytes) {
+    (void)tiled_mma;
+    Tensor bf16 = make_fragment_like<Element>(acc);
+    CUTE_UNROLL
+    for (int i = 0; i < size(bf16); ++i) {
+        bf16(i) = Element(acc(i));
+    }
+    copy(r2s, r2s_thr.retile_S(bf16), r2s_thr.partition_D(sTile(_, _, _0{})));
+    store_bf16frag_64x32(tid, smem_store, gmem, row_stride_bytes, bf16);
 }
 
 template <typename STile>
@@ -412,7 +455,7 @@ load_acc_64x32_bf16_from_smem(int tid, Element* smem_load, AccFrag& acc) {
     acc(15) = f15;
 }
 
-template <int KDim>
+template <int KDim, int HStatic = 0>
 __global__
 __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
     Element const* __restrict__ q,
@@ -426,12 +469,13 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
     Element* __restrict__ dv2,
     int B,
     int T,
-    int H,
+    int HArg,
     int NT,
     float scale,
     bool has_dht,
     bool store_dh0) {
     (void)B;
+    int const H = HStatic == 0 ? HArg : HStatic;
     int tid = int(threadIdx.x);
     int v_tile = int(blockIdx.x);
     int bh = int(blockIdx.y);
@@ -643,14 +687,27 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
         int64_t dh_base = (((int64_t(b) * NT + chunk) * H + h) * KDim) * kV + v_base;
         // FLA/Triton stores dh before applying this chunk's update.  The
         // global-store layout is separate from the WGMMA-B shared tile.
-        r2s_acc(update_mma, r2s_update, r2s_update_thr, state, sDhStore);
-        cutlass::arch::fence_view_async_shared();
-        store_acc_64x32_bf16(tid, smem_dh_bridge, dh + dh_base, uint32_t(kV * sizeof(Element)), state);
+        r2s_acc_store(
+            update_mma,
+            r2s_update,
+            r2s_update_thr,
+            state,
+            sDhStore,
+            tid,
+            smem_dh_bridge,
+            dh + dh_base,
+            uint32_t(kV * sizeof(Element)));
         if constexpr (KDim > kK) {
-            r2s_acc(update_mma, r2s_update, r2s_update_thr, state1, sDhStore1);
-            cutlass::arch::fence_view_async_shared();
-            store_acc_64x32_bf16(
-                tid, smem_dh_bridge, dh + dh_base + int64_t(kK) * kV, uint32_t(kV * sizeof(Element)), state1);
+            r2s_acc_store(
+                update_mma,
+                r2s_update,
+                r2s_update_thr,
+                state1,
+                sDhStore1,
+                tid,
+                smem_dh_bridge,
+                dh + dh_base + int64_t(kK) * kV,
+                uint32_t(kV * sizeof(Element)));
         }
 
         if constexpr (KDim > kK) {
@@ -719,11 +776,17 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
             warpgroup_wait<0>();
             warpgroup_fence_operand(acc_dv);
         }
-        cutlass::arch::fence_view_async_shared();
 
-        r2s_acc(kdh_mma, r2s_kdh, r2s_kdh_thr, acc_dv, sDv2Store);
-        cutlass::arch::fence_view_async_shared();
-        store_acc_64x32_bf16(tid, smem_dv2_bridge, dv2 + base_v, uint32_t(H * kV * sizeof(Element)), acc_dv);
+        r2s_acc_store(
+            kdh_mma,
+            r2s_kdh,
+            r2s_kdh_thr,
+            acc_dv,
+            sDv2Store,
+            tid,
+            smem_dv2_bridge,
+            dv2 + base_v,
+            uint32_t(H * kV * sizeof(Element)));
 
         Tensor tQ = update_thr.partition_A(sQStage);
         Tensor tQR = update_thr.make_fragment_A(tQ);
@@ -757,7 +820,6 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
             warpgroup_wait<0>();
             warpgroup_fence_operand(acc_qdo);
             warpgroup_fence_operand(acc_qdo1);
-            cutlass::arch::fence_view_async_shared();
 
             warpgroup_fence_operand(acc_wdv);
             warpgroup_fence_operand(acc_wdv1);
@@ -790,7 +852,6 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
 
             warpgroup_wait<0>();
             warpgroup_fence_operand(acc_qdo);
-            cutlass::arch::fence_view_async_shared();
 
             Tensor tW = update_thr.partition_A(sWStage);
             Tensor tWR = update_thr.make_fragment_A(tW);
@@ -914,60 +975,58 @@ ChunkGatedDeltaRuleBwdDhu64(
     }
 
     auto stream = at::cuda::getCurrentCUDAStream();
-    static std::once_flag attr_once64;
-    static std::once_flag attr_once128;
+    auto launch = [&]<int KDim, int HStatic>() {
+        static std::once_flag attr_once;
+        std::call_once(attr_once, [] {
+            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                chunk_delta_bwd_dhu64_sm90_kernel<KDim, HStatic>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                kSmemBytes<KDim>));
+            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                chunk_delta_bwd_dhu64_sm90_kernel<KDim, HStatic>,
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                cudaSharedmemCarveoutMaxShared));
+        });
+        chunk_delta_bwd_dhu64_sm90_kernel<KDim, HStatic>
+            <<<dim3(kV / kBV, B * H), dim3(kThreads), kSmemBytes<KDim>, stream>>>(
+                reinterpret_cast<Element const*>(q.data_ptr<at::BFloat16>()),
+                reinterpret_cast<Element const*>(k.data_ptr<at::BFloat16>()),
+                reinterpret_cast<Element const*>(w.data_ptr<at::BFloat16>()),
+                reinterpret_cast<Element const*>(dO.data_ptr<at::BFloat16>()),
+                reinterpret_cast<Element const*>(dV.data_ptr<at::BFloat16>()),
+                dht.has_value() ? dht->data_ptr<float>() : nullptr,
+                reinterpret_cast<Element*>(dh.data_ptr<at::BFloat16>()),
+                dh0.has_value() ? dh0->data_ptr<float>() : nullptr,
+                reinterpret_cast<Element*>(dv2.data_ptr<at::BFloat16>()),
+                static_cast<int>(B),
+                static_cast<int>(T),
+                static_cast<int>(H),
+                static_cast<int>(NT),
+                static_cast<float>(scale),
+                dht.has_value(),
+                dh0.has_value());
+    };
+
     if (K == 64) {
-        std::call_once(attr_once64, [] {
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                chunk_delta_bwd_dhu64_sm90_kernel<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes<64>));
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                chunk_delta_bwd_dhu64_sm90_kernel<64>,
-                cudaFuncAttributePreferredSharedMemoryCarveout,
-                cudaSharedmemCarveoutMaxShared));
-        });
-        chunk_delta_bwd_dhu64_sm90_kernel<64><<<dim3(kV / kBV, B * H), dim3(kThreads), kSmemBytes<64>, stream>>>(
-            reinterpret_cast<Element const*>(q.data_ptr<at::BFloat16>()),
-            reinterpret_cast<Element const*>(k.data_ptr<at::BFloat16>()),
-            reinterpret_cast<Element const*>(w.data_ptr<at::BFloat16>()),
-            reinterpret_cast<Element const*>(dO.data_ptr<at::BFloat16>()),
-            reinterpret_cast<Element const*>(dV.data_ptr<at::BFloat16>()),
-            dht.has_value() ? dht->data_ptr<float>() : nullptr,
-            reinterpret_cast<Element*>(dh.data_ptr<at::BFloat16>()),
-            dh0.has_value() ? dh0->data_ptr<float>() : nullptr,
-            reinterpret_cast<Element*>(dv2.data_ptr<at::BFloat16>()),
-            static_cast<int>(B),
-            static_cast<int>(T),
-            static_cast<int>(H),
-            static_cast<int>(NT),
-            static_cast<float>(scale),
-            dht.has_value(),
-            dh0.has_value());
+        if (H == 8) {
+            launch.template operator()<64, 8>();
+        } else if (H == 64) {
+            launch.template operator()<64, 64>();
+        } else if (H == 1) {
+            launch.template operator()<64, 1>();
+        } else {
+            launch.template operator()<64, 0>();
+        }
     } else {
-        std::call_once(attr_once128, [] {
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                chunk_delta_bwd_dhu64_sm90_kernel<128>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes<128>));
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                chunk_delta_bwd_dhu64_sm90_kernel<128>,
-                cudaFuncAttributePreferredSharedMemoryCarveout,
-                cudaSharedmemCarveoutMaxShared));
-        });
-        chunk_delta_bwd_dhu64_sm90_kernel<128><<<dim3(kV / kBV, B * H), dim3(kThreads), kSmemBytes<128>, stream>>>(
-            reinterpret_cast<Element const*>(q.data_ptr<at::BFloat16>()),
-            reinterpret_cast<Element const*>(k.data_ptr<at::BFloat16>()),
-            reinterpret_cast<Element const*>(w.data_ptr<at::BFloat16>()),
-            reinterpret_cast<Element const*>(dO.data_ptr<at::BFloat16>()),
-            reinterpret_cast<Element const*>(dV.data_ptr<at::BFloat16>()),
-            dht.has_value() ? dht->data_ptr<float>() : nullptr,
-            reinterpret_cast<Element*>(dh.data_ptr<at::BFloat16>()),
-            dh0.has_value() ? dh0->data_ptr<float>() : nullptr,
-            reinterpret_cast<Element*>(dv2.data_ptr<at::BFloat16>()),
-            static_cast<int>(B),
-            static_cast<int>(T),
-            static_cast<int>(H),
-            static_cast<int>(NT),
-            static_cast<float>(scale),
-            dht.has_value(),
-            dh0.has_value());
+        if (H == 8) {
+            launch.template operator()<128, 8>();
+        } else if (H == 64) {
+            launch.template operator()<128, 64>();
+        } else if (H == 1) {
+            launch.template operator()<128, 1>();
+        } else {
+            launch.template operator()<128, 0>();
+        }
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
