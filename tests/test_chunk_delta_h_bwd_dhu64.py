@@ -91,6 +91,19 @@ def test_bwd_dhu64_long_t_against_fla(K: int):
     torch.testing.assert_close(our_dh0.float(), ref_dh0.float(), atol=5e-2, rtol=5e-2)
 
 
+def test_bwd_dhu64_h64_k128_against_fla():
+    q, k, w, do, dv, h0, dht = _make_inputs(1, 128, 64, 128, use_h0=True, use_dht=True, seed=11)
+    scale = 0.125
+
+    ref_dh, ref_dh0, ref_dv2 = fla_bwd_dhu(q=q, k=k, w=w, do=do, dv=dv, h0=h0, dht=dht, scale=scale, chunk_size=64)
+    our_dh, our_dh0, our_dv2 = cula_bwd_dhu(q=q, k=k, w=w, do=do, dv=dv, h0=h0, dht=dht, scale=scale, chunk_size=64)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(our_dh.float(), ref_dh.float(), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(our_dv2.float(), ref_dv2.float(), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(our_dh0.float(), ref_dh0.float(), atol=5e-2, rtol=5e-2)
+
+
 def test_bwd_dhu64_rejects_unsupported_options():
     q, k, w, do, dv, h0, dht = _make_inputs(1, 64, 1, use_h0=True, use_dht=True)
     gk = torch.zeros_like(q, dtype=torch.float32)

@@ -52,12 +52,16 @@ constexpr int kDvPrefetchStages = KDim > kK ? 2 : 0;
 template <int KDim>
 constexpr int kPrefetchDistance = KDim > kK ? 2 : kStages;
 
-template <int KDim>
-constexpr int kSmemElements = kStages * (kBT * kBV + kKBlocks<KDim> * 3 * kBT * kK) +
-                              kDvPrefetchStages<KDim> * kBT * kBV + (kKBlocks<KDim> + 3) * kBT * kBV;
+template <int VTile>
+constexpr int kVBlocks = VTile / kBV;
 
-template <int KDim>
-constexpr int kSmemBytes = kSmemElements<KDim> * int(sizeof(Element));
+template <int KDim, int VTile>
+constexpr int kSmemElements =
+    kStages * (kVBlocks<VTile> * kBT * kBV + kKBlocks<KDim> * 3 * kBT * kK) +
+    kDvPrefetchStages<KDim> * kVBlocks<VTile> * kBT * kBV + (kKBlocks<KDim> * kVBlocks<VTile> + 3) * kBT * kBV;
+
+template <int KDim, int VTile>
+constexpr int kSmemBytes = kSmemElements<KDim, VTile> * int(sizeof(Element));
 
 template <typename TiledMma, typename TiledCopy, typename ThrCopy, typename AccFrag, typename STile>
 CUTE_DEVICE void
@@ -455,7 +459,7 @@ load_acc_64x32_bf16_from_smem(int tid, Element* smem_load, AccFrag& acc) {
     acc(15) = f15;
 }
 
-template <int KDim, int HStatic = 0>
+template <int KDim, int HStatic = 0, int VTile = kBV>
 __global__
 __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
     Element const* __restrict__ q,
@@ -474,6 +478,8 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
     float scale,
     bool has_dht,
     bool store_dh0) {
+    static_assert(VTile == kBV || VTile == kV);
+    static_assert(kV % VTile == 0);
     (void)B;
     int const H = HStatic == 0 ? HArg : HStatic;
     int tid = int(threadIdx.x);
@@ -481,7 +487,7 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
     int bh = int(blockIdx.y);
     int b = bh / H;
     int h = bh - b * H;
-    int v_base = v_tile * kBV;
+    int v_base = v_tile * VTile;
 
     auto shape_mnk = make_shape(Int<64>{}, Int<32>{}, Int<64>{});
     auto cta_tiler = make_shape(Int<64>{}, Int<32>{}, Int<64>{});
@@ -496,16 +502,17 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
         decltype(tile_to_shape(GMMA::Layout_MN_SW64_Atom<Element>{}, make_shape(Int<32>{}, Int<64>{}, Int<1>{})));
 
     constexpr int kSmemDoOffset = 0;
-    constexpr int kSmemKOffset = kSmemDoOffset + kStages * cosize_v<SmemLayoutMN32Read>;
+    constexpr int kSmemKOffset = kSmemDoOffset + kStages * kVBlocks<VTile> * cosize_v<SmemLayoutMN32Read>;
     constexpr int kSmemWOffset = kSmemKOffset + kKBlocks<KDim> * kStages * cosize_v<SmemLayoutK64>;
     constexpr int kSmemQOffset = kSmemWOffset + kKBlocks<KDim> * kStages * cosize_v<SmemLayoutMN64>;
     constexpr int kSmemDvPrefOffset = kSmemQOffset + kKBlocks<KDim> * kStages * cosize_v<SmemLayoutMN64>;
-    constexpr int kSmemDhOffset = kSmemDvPrefOffset + kDvPrefetchStages<KDim> * cosize_v<SmemLayoutMN32Read>;
-    constexpr int kSmemDv2Offset = kSmemDhOffset + kKBlocks<KDim> * cosize_v<SmemLayoutK32>;
+    constexpr int kSmemDhOffset =
+        kSmemDvPrefOffset + kDvPrefetchStages<KDim> * kVBlocks<VTile> * cosize_v<SmemLayoutMN32Read>;
+    constexpr int kSmemDv2Offset = kSmemDhOffset + kKBlocks<KDim> * kVBlocks<VTile> * cosize_v<SmemLayoutK32>;
     constexpr int kSmemDhBridgeOffset = kSmemDv2Offset + cosize_v<SmemLayoutK32>;
     constexpr int kSmemDv2BridgeOffset = kSmemDhBridgeOffset + cosize_v<SmemLayoutK32>;
     constexpr int kSmemTotal = kSmemDv2BridgeOffset + cosize_v<SmemLayoutK32>;
-    static_assert(kSmemTotal == kSmemElements<KDim>);
+    static_assert(kSmemTotal == kSmemElements<KDim, VTile>);
 
     extern __shared__ __align__(128) unsigned char smem_bytes[];
     Element* smem_raw = reinterpret_cast<Element*>(smem_bytes);
@@ -522,8 +529,15 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
 
     Tensor sDhStore = make_tensor(make_smem_ptr(smem_dh), SmemLayoutK32{});
     Tensor sDhRead = make_tensor(make_smem_ptr(smem_dh), SmemLayoutMN32Read{});
-    Tensor sDhStore1 = make_tensor(make_smem_ptr(smem_dh + cosize_v<SmemLayoutK32>), SmemLayoutK32{});
-    Tensor sDhRead1 = make_tensor(make_smem_ptr(smem_dh + cosize_v<SmemLayoutK32>), SmemLayoutMN32Read{});
+    Tensor sDhStoreV1 = make_tensor(make_smem_ptr(smem_dh + cosize_v<SmemLayoutK32>), SmemLayoutK32{});
+    Tensor sDhReadV1 = make_tensor(make_smem_ptr(smem_dh + cosize_v<SmemLayoutK32>), SmemLayoutMN32Read{});
+    Tensor sDhStore1 = make_tensor(make_smem_ptr(smem_dh + kVBlocks<VTile> * cosize_v<SmemLayoutK32>), SmemLayoutK32{});
+    Tensor sDhRead1 =
+        make_tensor(make_smem_ptr(smem_dh + kVBlocks<VTile> * cosize_v<SmemLayoutK32>), SmemLayoutMN32Read{});
+    Tensor sDhStore1V1 =
+        make_tensor(make_smem_ptr(smem_dh + (kVBlocks<VTile> + 1) * cosize_v<SmemLayoutK32>), SmemLayoutK32{});
+    Tensor sDhRead1V1 =
+        make_tensor(make_smem_ptr(smem_dh + (kVBlocks<VTile> + 1) * cosize_v<SmemLayoutK32>), SmemLayoutMN32Read{});
     Tensor sDv2Store = make_tensor(make_smem_ptr(smem_dv2), SmemLayoutK32{});
     Tensor sDv2Read = make_tensor(make_smem_ptr(smem_dv2), SmemLayoutMN32Read{});
 
@@ -550,6 +564,8 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
     auto tCUpdate = update_thr.partition_C(c_kv);
     Tensor state = update_thr.make_fragment_C(tCUpdate);
     Tensor state1 = update_thr.make_fragment_C(tCUpdate);
+    Tensor state_v1 = update_thr.make_fragment_C(tCUpdate);
+    Tensor state1_v1 = update_thr.make_fragment_C(tCUpdate);
     if (has_dht) {
         CUTE_UNROLL
         for (int i = 0; i < size(state); ++i) {
@@ -558,14 +574,26 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
             int v_rel = int(get<1>(coord));
             int64_t off = ((int64_t(b) * H + h) * KDim + k_rel) * kV + v_base + v_rel;
             state(i) = dht[off];
+            if constexpr (VTile > kBV) {
+                state_v1(i) = dht[off + kBV];
+            }
             if constexpr (KDim > kK) {
                 state1(i) = dht[off + int64_t(kK) * kV];
+                if constexpr (VTile > kBV) {
+                    state1_v1(i) = dht[off + int64_t(kK) * kV + kBV];
+                }
             }
         }
     } else {
         clear(state);
+        if constexpr (VTile > kBV) {
+            clear(state_v1);
+        }
         if constexpr (KDim > kK) {
             clear(state1);
+            if constexpr (VTile > kBV) {
+                clear(state1_v1);
+            }
         }
     }
 
@@ -574,8 +602,8 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
         int64_t base_t = (int64_t(b) * T + t0) * H * KDim + int64_t(h) * KDim;
         int64_t base_v = (int64_t(b) * T + t0) * H * kV + int64_t(h) * kV + v_base;
 
-        Tensor sDoStage =
-            make_tensor(make_smem_ptr(smem_do + stage * cosize_v<SmemLayoutMN32Read>), SmemLayoutMN32Read{});
+        Tensor sDoStage = make_tensor(
+            make_smem_ptr(smem_do + stage * kVBlocks<VTile> * cosize_v<SmemLayoutMN32Read>), SmemLayoutMN32Read{});
         Tensor sKStage =
             make_tensor(make_smem_ptr(smem_k + stage * kKBlocks<KDim> * cosize_v<SmemLayoutK64>), SmemLayoutK64{});
         Tensor sWStage =
@@ -641,9 +669,23 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
         }
 
         cp_async_do_tile(tid, do_ + base_v, sDoStage, H);
+        if constexpr (VTile > kBV) {
+            Tensor sDoStageV1 = make_tensor(
+                make_smem_ptr(smem_do + (stage * kVBlocks<VTile> + 1) * cosize_v<SmemLayoutMN32Read>),
+                SmemLayoutMN32Read{});
+            cp_async_do_tile(tid, do_ + base_v + kBV, sDoStageV1, H);
+        }
         if constexpr (KDim > kK) {
             int dv_stage = (NT - 1 - chunk) & 1;
-            cp_async_dv_bridge_tile(tid, dv + base_v, smem_dv_pref + dv_stage * cosize_v<SmemLayoutMN32Read>, H);
+            cp_async_dv_bridge_tile(
+                tid, dv + base_v, smem_dv_pref + dv_stage * kVBlocks<VTile> * cosize_v<SmemLayoutMN32Read>, H);
+            if constexpr (VTile > kBV) {
+                cp_async_dv_bridge_tile(
+                    tid,
+                    dv + base_v + kBV,
+                    smem_dv_pref + (dv_stage * kVBlocks<VTile> + 1) * cosize_v<SmemLayoutMN32Read>,
+                    H);
+            }
         }
         cp_async_fence();
     };
@@ -669,8 +711,11 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
         int t0 = chunk * kBT;
         int64_t base_v = (int64_t(b) * T + t0) * H * kV + int64_t(h) * kV + v_base;
 
-        Tensor sDoStage =
-            make_tensor(make_smem_ptr(smem_do + stage * cosize_v<SmemLayoutMN32Read>), SmemLayoutMN32Read{});
+        Tensor sDoStage = make_tensor(
+            make_smem_ptr(smem_do + stage * kVBlocks<VTile> * cosize_v<SmemLayoutMN32Read>), SmemLayoutMN32Read{});
+        Tensor sDoStageV1 = make_tensor(
+            make_smem_ptr(smem_do + (stage * kVBlocks<VTile> + 1) * cosize_v<SmemLayoutMN32Read>),
+            SmemLayoutMN32Read{});
         Tensor sKStage =
             make_tensor(make_smem_ptr(smem_k + stage * kKBlocks<KDim> * cosize_v<SmemLayoutK64>), SmemLayoutK64{});
         Tensor sWStage =
@@ -709,6 +754,30 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
                 dh + dh_base + int64_t(kK) * kV,
                 uint32_t(kV * sizeof(Element)));
         }
+        if constexpr (VTile > kBV) {
+            r2s_acc_store(
+                update_mma,
+                r2s_update,
+                r2s_update_thr,
+                state_v1,
+                sDhStoreV1,
+                tid,
+                smem_dh_bridge,
+                dh + dh_base + kBV,
+                uint32_t(kV * sizeof(Element)));
+            if constexpr (KDim > kK) {
+                r2s_acc_store(
+                    update_mma,
+                    r2s_update,
+                    r2s_update_thr,
+                    state1_v1,
+                    sDhStore1V1,
+                    tid,
+                    smem_dh_bridge,
+                    dh + dh_base + int64_t(kK) * kV + kBV,
+                    uint32_t(kV * sizeof(Element)));
+            }
+        }
 
         if constexpr (KDim > kK) {
             if (pending_groups >= 6) {
@@ -734,138 +803,299 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
 
         Tensor tK = kdh_thr.partition_A(sKStage);
         Tensor tKR = kdh_thr.make_fragment_A(tK);
-        Tensor tDh = kdh_thr.partition_B(sDhRead);
-        Tensor tDhR = kdh_thr.make_fragment_B(tDh);
         Tensor tK1 = kdh_thr.partition_A(sKStage1);
         Tensor tK1R = kdh_thr.make_fragment_A(tK1);
-        Tensor tDh1 = kdh_thr.partition_B(sDhRead1);
-        Tensor tDh1R = kdh_thr.make_fragment_B(tDh1);
         auto c_tv = make_identity_tensor(make_shape(Int<64>{}, Int<32>{}));
         auto tCKdh = kdh_thr.partition_C(c_tv);
-        Tensor acc_dv = kdh_thr.make_fragment_C(tCKdh);
-        if constexpr (KDim > kK) {
-            clear(acc_dv);
+        if constexpr (VTile == kBV) {
+            Tensor tDh = kdh_thr.partition_B(sDhRead);
+            Tensor tDhR = kdh_thr.make_fragment_B(tDh);
+            Tensor tDh1 = kdh_thr.partition_B(sDhRead1);
+            Tensor tDh1R = kdh_thr.make_fragment_B(tDh1);
+            Tensor acc_dv = kdh_thr.make_fragment_C(tCKdh);
+            if constexpr (KDim > kK) {
+                clear(acc_dv);
 
-            warpgroup_fence_operand(acc_dv);
-            warpgroup_arrive();
-            gemm(kdh_mma, tKR(_, _, _, _0{}), tDhR(_, _, _, _0{}), acc_dv);
-            warpgroup_commit_batch();
-            warpgroup_wait<0>();
-            warpgroup_fence_operand(acc_dv);
+                warpgroup_fence_operand(acc_dv);
+                warpgroup_arrive();
+                gemm(kdh_mma, tKR(_, _, _, _0{}), tDhR(_, _, _, _0{}), acc_dv);
+                warpgroup_commit_batch();
+                warpgroup_wait<0>();
+                warpgroup_fence_operand(acc_dv);
 
-            warpgroup_arrive();
-            gemm(kdh_mma, tK1R(_, _, _, _0{}), tDh1R(_, _, _, _0{}), acc_dv);
-            warpgroup_commit_batch();
-            warpgroup_wait<0>();
-            warpgroup_fence_operand(acc_dv);
+                warpgroup_arrive();
+                gemm(kdh_mma, tK1R(_, _, _, _0{}), tDh1R(_, _, _, _0{}), acc_dv);
+                warpgroup_commit_batch();
+                warpgroup_wait<0>();
+                warpgroup_fence_operand(acc_dv);
 
-            Tensor acc_dv_in = kdh_thr.make_fragment_C(tCKdh);
+                Tensor acc_dv_in = kdh_thr.make_fragment_C(tCKdh);
+                int dv_stage = iter & 1;
+                load_acc_64x32_bf16_from_smem(tid, smem_dv_pref + dv_stage * cosize_v<SmemLayoutMN32Read>, acc_dv_in);
+                CUTE_UNROLL
+                for (int i = 0; i < size(acc_dv); ++i) {
+                    acc_dv(i) += acc_dv_in(i);
+                }
+            } else {
+                load_acc_64x32_bf16(tid, smem_dh_bridge, dv + base_v, uint32_t(H * kV * sizeof(Element)), acc_dv);
+
+                warpgroup_fence_operand(acc_dv);
+                warpgroup_arrive();
+                gemm(kdh_mma, tKR(_, _, _, _0{}), tDhR(_, _, _, _0{}), acc_dv);
+                warpgroup_commit_batch();
+                warpgroup_wait<0>();
+                warpgroup_fence_operand(acc_dv);
+            }
+
+            r2s_acc_store(
+                kdh_mma,
+                r2s_kdh,
+                r2s_kdh_thr,
+                acc_dv,
+                sDv2Store,
+                tid,
+                smem_dv2_bridge,
+                dv2 + base_v,
+                uint32_t(H * kV * sizeof(Element)));
+
+            Tensor tQ = update_thr.partition_A(sQStage);
+            Tensor tQR = update_thr.make_fragment_A(tQ);
+            Tensor tDo = update_thr.partition_B(sDoStage);
+            Tensor tDoR = update_thr.make_fragment_B(tDo);
+            Tensor tDv2 = update_thr.partition_B(sDv2Read);
+            Tensor tDv2R = update_thr.make_fragment_B(tDv2);
+
+            if constexpr (KDim > kK) {
+                Tensor tQ1 = update_thr.partition_A(sQStage1);
+                Tensor tQ1R = update_thr.make_fragment_A(tQ1);
+                Tensor tW = update_thr.partition_A(sWStage);
+                Tensor tWR = update_thr.make_fragment_A(tW);
+                Tensor tW1 = update_thr.partition_A(sWStage1);
+                Tensor tW1R = update_thr.make_fragment_A(tW1);
+                Tensor acc_qdo = update_thr.make_fragment_C(tCUpdate);
+                Tensor acc_wdv = update_thr.make_fragment_C(tCUpdate);
+                Tensor acc_qdo1 = update_thr.make_fragment_C(tCUpdate);
+                Tensor acc_wdv1 = update_thr.make_fragment_C(tCUpdate);
+                clear(acc_qdo);
+                clear(acc_wdv);
+                clear(acc_qdo1);
+                clear(acc_wdv1);
+
+                warpgroup_fence_operand(acc_qdo);
+                warpgroup_fence_operand(acc_qdo1);
+                warpgroup_arrive();
+                gemm(update_mma, tQR(_, _, _, _0{}), tDoR(_, _, _, _0{}), acc_qdo);
+                gemm(update_mma, tQ1R(_, _, _, _0{}), tDoR(_, _, _, _0{}), acc_qdo1);
+                warpgroup_commit_batch();
+                warpgroup_wait<0>();
+                warpgroup_fence_operand(acc_qdo);
+                warpgroup_fence_operand(acc_qdo1);
+
+                warpgroup_fence_operand(acc_wdv);
+                warpgroup_fence_operand(acc_wdv1);
+                warpgroup_arrive();
+                gemm(update_mma, tWR(_, _, _, _0{}), tDv2R(_, _, _, _0{}), acc_wdv);
+                gemm(update_mma, tW1R(_, _, _, _0{}), tDv2R(_, _, _, _0{}), acc_wdv1);
+                warpgroup_commit_batch();
+                warpgroup_wait<0>();
+                warpgroup_fence_operand(acc_wdv);
+                warpgroup_fence_operand(acc_wdv1);
+
+                CUTE_UNROLL
+                for (int i = 0; i < size(state); ++i) {
+                    state(i) += acc_qdo(i) * scale - acc_wdv(i);
+                }
+                CUTE_UNROLL
+                for (int i = 0; i < size(state1); ++i) {
+                    state1(i) += acc_qdo1(i) * scale - acc_wdv1(i);
+                }
+            } else {
+                Tensor acc_qdo = update_thr.make_fragment_C(tCUpdate);
+                Tensor acc_wdv = update_thr.make_fragment_C(tCUpdate);
+                clear(acc_qdo);
+                clear(acc_wdv);
+
+                warpgroup_fence_operand(acc_qdo);
+                warpgroup_arrive();
+                gemm(update_mma, tQR(_, _, _, _0{}), tDoR(_, _, _, _0{}), acc_qdo);
+                warpgroup_commit_batch();
+
+                warpgroup_wait<0>();
+                warpgroup_fence_operand(acc_qdo);
+
+                Tensor tW = update_thr.partition_A(sWStage);
+                Tensor tWR = update_thr.make_fragment_A(tW);
+
+                warpgroup_fence_operand(acc_wdv);
+                warpgroup_arrive();
+                gemm(update_mma, tWR(_, _, _, _0{}), tDv2R(_, _, _, _0{}), acc_wdv);
+                warpgroup_commit_batch();
+                warpgroup_wait<0>();
+                warpgroup_fence_operand(acc_wdv);
+
+                CUTE_UNROLL
+                for (int i = 0; i < size(state); ++i) {
+                    state(i) += acc_qdo(i) * scale - acc_wdv(i);
+                }
+            }
+        } else {
+            auto process_v_half = [&](auto const& sDhReadHalf,
+                                      auto const& sDhRead1Half,
+                                      auto const& sDoStageHalf,
+                                      Element* smem_dv_half,
+                                      int v_offset,
+                                      auto& state_half,
+                                      auto& state1_half) {
+                Tensor tDh = kdh_thr.partition_B(sDhReadHalf);
+                Tensor tDhR = kdh_thr.make_fragment_B(tDh);
+                Tensor tDh1 = kdh_thr.partition_B(sDhRead1Half);
+                Tensor tDh1R = kdh_thr.make_fragment_B(tDh1);
+                Tensor acc_dv = kdh_thr.make_fragment_C(tCKdh);
+                if constexpr (KDim > kK) {
+                    clear(acc_dv);
+
+                    warpgroup_fence_operand(acc_dv);
+                    warpgroup_arrive();
+                    gemm(kdh_mma, tKR(_, _, _, _0{}), tDhR(_, _, _, _0{}), acc_dv);
+                    warpgroup_commit_batch();
+                    warpgroup_wait<0>();
+                    warpgroup_fence_operand(acc_dv);
+
+                    warpgroup_arrive();
+                    gemm(kdh_mma, tK1R(_, _, _, _0{}), tDh1R(_, _, _, _0{}), acc_dv);
+                    warpgroup_commit_batch();
+                    warpgroup_wait<0>();
+                    warpgroup_fence_operand(acc_dv);
+
+                    Tensor acc_dv_in = kdh_thr.make_fragment_C(tCKdh);
+                    load_acc_64x32_bf16_from_smem(tid, smem_dv_half, acc_dv_in);
+                    CUTE_UNROLL
+                    for (int i = 0; i < size(acc_dv); ++i) {
+                        acc_dv(i) += acc_dv_in(i);
+                    }
+                } else {
+                    load_acc_64x32_bf16(
+                        tid, smem_dh_bridge, dv + base_v + v_offset, uint32_t(H * kV * sizeof(Element)), acc_dv);
+
+                    warpgroup_fence_operand(acc_dv);
+                    warpgroup_arrive();
+                    gemm(kdh_mma, tKR(_, _, _, _0{}), tDhR(_, _, _, _0{}), acc_dv);
+                    warpgroup_commit_batch();
+                    warpgroup_wait<0>();
+                    warpgroup_fence_operand(acc_dv);
+                }
+
+                r2s_acc_store(
+                    kdh_mma,
+                    r2s_kdh,
+                    r2s_kdh_thr,
+                    acc_dv,
+                    sDv2Store,
+                    tid,
+                    smem_dv2_bridge,
+                    dv2 + base_v + v_offset,
+                    uint32_t(H * kV * sizeof(Element)));
+
+                Tensor tQ = update_thr.partition_A(sQStage);
+                Tensor tQR = update_thr.make_fragment_A(tQ);
+                Tensor tDo = update_thr.partition_B(sDoStageHalf);
+                Tensor tDoR = update_thr.make_fragment_B(tDo);
+                Tensor tDv2 = update_thr.partition_B(sDv2Read);
+                Tensor tDv2R = update_thr.make_fragment_B(tDv2);
+
+                if constexpr (KDim > kK) {
+                    Tensor tQ1 = update_thr.partition_A(sQStage1);
+                    Tensor tQ1R = update_thr.make_fragment_A(tQ1);
+                    Tensor tW = update_thr.partition_A(sWStage);
+                    Tensor tWR = update_thr.make_fragment_A(tW);
+                    Tensor tW1 = update_thr.partition_A(sWStage1);
+                    Tensor tW1R = update_thr.make_fragment_A(tW1);
+                    Tensor acc_qdo = update_thr.make_fragment_C(tCUpdate);
+                    Tensor acc_wdv = update_thr.make_fragment_C(tCUpdate);
+                    Tensor acc_qdo1 = update_thr.make_fragment_C(tCUpdate);
+                    Tensor acc_wdv1 = update_thr.make_fragment_C(tCUpdate);
+                    clear(acc_qdo);
+                    clear(acc_wdv);
+                    clear(acc_qdo1);
+                    clear(acc_wdv1);
+
+                    warpgroup_fence_operand(acc_qdo);
+                    warpgroup_fence_operand(acc_qdo1);
+                    warpgroup_arrive();
+                    gemm(update_mma, tQR(_, _, _, _0{}), tDoR(_, _, _, _0{}), acc_qdo);
+                    gemm(update_mma, tQ1R(_, _, _, _0{}), tDoR(_, _, _, _0{}), acc_qdo1);
+                    warpgroup_commit_batch();
+                    warpgroup_wait<0>();
+                    warpgroup_fence_operand(acc_qdo);
+                    warpgroup_fence_operand(acc_qdo1);
+
+                    warpgroup_fence_operand(acc_wdv);
+                    warpgroup_fence_operand(acc_wdv1);
+                    warpgroup_arrive();
+                    gemm(update_mma, tWR(_, _, _, _0{}), tDv2R(_, _, _, _0{}), acc_wdv);
+                    gemm(update_mma, tW1R(_, _, _, _0{}), tDv2R(_, _, _, _0{}), acc_wdv1);
+                    warpgroup_commit_batch();
+                    warpgroup_wait<0>();
+                    warpgroup_fence_operand(acc_wdv);
+                    warpgroup_fence_operand(acc_wdv1);
+
+                    CUTE_UNROLL
+                    for (int i = 0; i < size(state_half); ++i) {
+                        state_half(i) += acc_qdo(i) * scale - acc_wdv(i);
+                    }
+                    CUTE_UNROLL
+                    for (int i = 0; i < size(state1_half); ++i) {
+                        state1_half(i) += acc_qdo1(i) * scale - acc_wdv1(i);
+                    }
+                } else {
+                    Tensor acc_qdo = update_thr.make_fragment_C(tCUpdate);
+                    Tensor acc_wdv = update_thr.make_fragment_C(tCUpdate);
+                    clear(acc_qdo);
+                    clear(acc_wdv);
+
+                    warpgroup_fence_operand(acc_qdo);
+                    warpgroup_arrive();
+                    gemm(update_mma, tQR(_, _, _, _0{}), tDoR(_, _, _, _0{}), acc_qdo);
+                    warpgroup_commit_batch();
+
+                    warpgroup_wait<0>();
+                    warpgroup_fence_operand(acc_qdo);
+
+                    Tensor tW = update_thr.partition_A(sWStage);
+                    Tensor tWR = update_thr.make_fragment_A(tW);
+
+                    warpgroup_fence_operand(acc_wdv);
+                    warpgroup_arrive();
+                    gemm(update_mma, tWR(_, _, _, _0{}), tDv2R(_, _, _, _0{}), acc_wdv);
+                    warpgroup_commit_batch();
+                    warpgroup_wait<0>();
+                    warpgroup_fence_operand(acc_wdv);
+
+                    CUTE_UNROLL
+                    for (int i = 0; i < size(state_half); ++i) {
+                        state_half(i) += acc_qdo(i) * scale - acc_wdv(i);
+                    }
+                }
+            };
+
             int dv_stage = iter & 1;
-            load_acc_64x32_bf16_from_smem(tid, smem_dv_pref + dv_stage * cosize_v<SmemLayoutMN32Read>, acc_dv_in);
-            CUTE_UNROLL
-            for (int i = 0; i < size(acc_dv); ++i) {
-                acc_dv(i) += acc_dv_in(i);
-            }
-        } else {
-            load_acc_64x32_bf16(tid, smem_dh_bridge, dv + base_v, uint32_t(H * kV * sizeof(Element)), acc_dv);
-
-            warpgroup_fence_operand(acc_dv);
-            warpgroup_arrive();
-            gemm(kdh_mma, tKR(_, _, _, _0{}), tDhR(_, _, _, _0{}), acc_dv);
-            warpgroup_commit_batch();
-            warpgroup_wait<0>();
-            warpgroup_fence_operand(acc_dv);
-        }
-
-        r2s_acc_store(
-            kdh_mma,
-            r2s_kdh,
-            r2s_kdh_thr,
-            acc_dv,
-            sDv2Store,
-            tid,
-            smem_dv2_bridge,
-            dv2 + base_v,
-            uint32_t(H * kV * sizeof(Element)));
-
-        Tensor tQ = update_thr.partition_A(sQStage);
-        Tensor tQR = update_thr.make_fragment_A(tQ);
-        Tensor tDo = update_thr.partition_B(sDoStage);
-        Tensor tDoR = update_thr.make_fragment_B(tDo);
-        Tensor tDv2 = update_thr.partition_B(sDv2Read);
-        Tensor tDv2R = update_thr.make_fragment_B(tDv2);
-
-        if constexpr (KDim > kK) {
-            Tensor tQ1 = update_thr.partition_A(sQStage1);
-            Tensor tQ1R = update_thr.make_fragment_A(tQ1);
-            Tensor tW = update_thr.partition_A(sWStage);
-            Tensor tWR = update_thr.make_fragment_A(tW);
-            Tensor tW1 = update_thr.partition_A(sWStage1);
-            Tensor tW1R = update_thr.make_fragment_A(tW1);
-            Tensor acc_qdo = update_thr.make_fragment_C(tCUpdate);
-            Tensor acc_wdv = update_thr.make_fragment_C(tCUpdate);
-            Tensor acc_qdo1 = update_thr.make_fragment_C(tCUpdate);
-            Tensor acc_wdv1 = update_thr.make_fragment_C(tCUpdate);
-            clear(acc_qdo);
-            clear(acc_wdv);
-            clear(acc_qdo1);
-            clear(acc_wdv1);
-
-            warpgroup_fence_operand(acc_qdo);
-            warpgroup_fence_operand(acc_qdo1);
-            warpgroup_arrive();
-            gemm(update_mma, tQR(_, _, _, _0{}), tDoR(_, _, _, _0{}), acc_qdo);
-            gemm(update_mma, tQ1R(_, _, _, _0{}), tDoR(_, _, _, _0{}), acc_qdo1);
-            warpgroup_commit_batch();
-            warpgroup_wait<0>();
-            warpgroup_fence_operand(acc_qdo);
-            warpgroup_fence_operand(acc_qdo1);
-
-            warpgroup_fence_operand(acc_wdv);
-            warpgroup_fence_operand(acc_wdv1);
-            warpgroup_arrive();
-            gemm(update_mma, tWR(_, _, _, _0{}), tDv2R(_, _, _, _0{}), acc_wdv);
-            gemm(update_mma, tW1R(_, _, _, _0{}), tDv2R(_, _, _, _0{}), acc_wdv1);
-            warpgroup_commit_batch();
-            warpgroup_wait<0>();
-            warpgroup_fence_operand(acc_wdv);
-            warpgroup_fence_operand(acc_wdv1);
-
-            CUTE_UNROLL
-            for (int i = 0; i < size(state); ++i) {
-                state(i) += acc_qdo(i) * scale - acc_wdv(i);
-            }
-            CUTE_UNROLL
-            for (int i = 0; i < size(state1); ++i) {
-                state1(i) += acc_qdo1(i) * scale - acc_wdv1(i);
-            }
-        } else {
-            Tensor acc_qdo = update_thr.make_fragment_C(tCUpdate);
-            Tensor acc_wdv = update_thr.make_fragment_C(tCUpdate);
-            clear(acc_qdo);
-            clear(acc_wdv);
-
-            warpgroup_fence_operand(acc_qdo);
-            warpgroup_arrive();
-            gemm(update_mma, tQR(_, _, _, _0{}), tDoR(_, _, _, _0{}), acc_qdo);
-            warpgroup_commit_batch();
-
-            warpgroup_wait<0>();
-            warpgroup_fence_operand(acc_qdo);
-
-            Tensor tW = update_thr.partition_A(sWStage);
-            Tensor tWR = update_thr.make_fragment_A(tW);
-
-            warpgroup_fence_operand(acc_wdv);
-            warpgroup_arrive();
-            gemm(update_mma, tWR(_, _, _, _0{}), tDv2R(_, _, _, _0{}), acc_wdv);
-            warpgroup_commit_batch();
-            warpgroup_wait<0>();
-            warpgroup_fence_operand(acc_wdv);
-
-            CUTE_UNROLL
-            for (int i = 0; i < size(state); ++i) {
-                state(i) += acc_qdo(i) * scale - acc_wdv(i);
+            process_v_half(
+                sDhRead,
+                sDhRead1,
+                sDoStage,
+                smem_dv_pref + dv_stage * kVBlocks<VTile> * cosize_v<SmemLayoutMN32Read>,
+                0,
+                state,
+                state1);
+            if constexpr (VTile > kBV) {
+                process_v_half(
+                    sDhReadV1,
+                    sDhRead1V1,
+                    sDoStageV1,
+                    smem_dv_pref + (dv_stage * kVBlocks<VTile> + 1) * cosize_v<SmemLayoutMN32Read>,
+                    kBV,
+                    state_v1,
+                    state1_v1);
             }
         }
 
@@ -893,8 +1123,14 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
             int v_rel = int(get<1>(coord));
             int64_t off = ((int64_t(b) * H + h) * KDim + k_rel) * kV + v_base + v_rel;
             dh0[off] = state(i);
+            if constexpr (VTile > kBV) {
+                dh0[off + kBV] = state_v1(i);
+            }
             if constexpr (KDim > kK) {
                 dh0[off + int64_t(kK) * kV] = state1(i);
+                if constexpr (VTile > kBV) {
+                    dh0[off + int64_t(kK) * kV + kBV] = state1_v1(i);
+                }
             }
         }
     }
@@ -975,20 +1211,20 @@ ChunkGatedDeltaRuleBwdDhu64(
     }
 
     auto stream = at::cuda::getCurrentCUDAStream();
-    auto launch = [&]<int KDim, int HStatic>() {
+    auto launch = [&]<int KDim, int HStatic, int VTile = kBV>() {
         static std::once_flag attr_once;
         std::call_once(attr_once, [] {
             C10_CUDA_CHECK(cudaFuncSetAttribute(
-                chunk_delta_bwd_dhu64_sm90_kernel<KDim, HStatic>,
+                chunk_delta_bwd_dhu64_sm90_kernel<KDim, HStatic, VTile>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
-                kSmemBytes<KDim>));
+                kSmemBytes<KDim, VTile>));
             C10_CUDA_CHECK(cudaFuncSetAttribute(
-                chunk_delta_bwd_dhu64_sm90_kernel<KDim, HStatic>,
+                chunk_delta_bwd_dhu64_sm90_kernel<KDim, HStatic, VTile>,
                 cudaFuncAttributePreferredSharedMemoryCarveout,
                 cudaSharedmemCarveoutMaxShared));
         });
-        chunk_delta_bwd_dhu64_sm90_kernel<KDim, HStatic>
-            <<<dim3(kV / kBV, B * H), dim3(kThreads), kSmemBytes<KDim>, stream>>>(
+        chunk_delta_bwd_dhu64_sm90_kernel<KDim, HStatic, VTile>
+            <<<dim3(kV / VTile, B * H), dim3(kThreads), kSmemBytes<KDim, VTile>, stream>>>(
                 reinterpret_cast<Element const*>(q.data_ptr<at::BFloat16>()),
                 reinterpret_cast<Element const*>(k.data_ptr<at::BFloat16>()),
                 reinterpret_cast<Element const*>(w.data_ptr<at::BFloat16>()),
@@ -1021,7 +1257,7 @@ ChunkGatedDeltaRuleBwdDhu64(
         if (H == 8) {
             launch.template operator()<128, 8>();
         } else if (H == 64) {
-            launch.template operator()<128, 64>();
+            launch.template operator()<128, 64, 64>();
         } else if (H == 1) {
             launch.template operator()<128, 1>();
         } else {
