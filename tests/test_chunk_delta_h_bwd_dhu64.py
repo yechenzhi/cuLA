@@ -22,10 +22,10 @@ from cula.ops.chunk_delta_h_bwd import chunk_gated_delta_rule_bwd_dhu as cula_bw
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 
-def _make_inputs(B: int, T: int, H: int, *, use_h0: bool, use_dht: bool, seed: int = 42):
+def _make_inputs(B: int, T: int, H: int, K: int = 64, *, use_h0: bool, use_dht: bool, seed: int = 42):
     torch.manual_seed(seed)
     device = "cuda"
-    K = V = 64
+    V = 64
 
     q = (torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
     k = (torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
@@ -38,9 +38,10 @@ def _make_inputs(B: int, T: int, H: int, *, use_h0: bool, use_dht: bool, seed: i
 
 
 @pytest.mark.parametrize("B,H,T", [(1, 1, 64), (2, 3, 256)])
+@pytest.mark.parametrize("K", [64, 128])
 @pytest.mark.parametrize("use_h0,use_dht", [(False, False), (False, True), (True, False), (True, True)])
-def test_bwd_dhu64_against_fla(B: int, H: int, T: int, use_h0: bool, use_dht: bool):
-    q, k, w, do, dv, h0, dht = _make_inputs(B, T, H, use_h0=use_h0, use_dht=use_dht)
+def test_bwd_dhu64_against_fla(B: int, H: int, T: int, K: int, use_h0: bool, use_dht: bool):
+    q, k, w, do, dv, h0, dht = _make_inputs(B, T, H, K, use_h0=use_h0, use_dht=use_dht)
     scale = 0.125
 
     ref_dh, ref_dh0, ref_dv2 = fla_bwd_dhu(
@@ -76,8 +77,9 @@ def test_bwd_dhu64_against_fla(B: int, H: int, T: int, use_h0: bool, use_dht: bo
         assert our_dh0 is None
 
 
-def test_bwd_dhu64_long_t_against_fla():
-    q, k, w, do, dv, h0, dht = _make_inputs(1, 4096, 1, use_h0=True, use_dht=True, seed=7)
+@pytest.mark.parametrize("K", [64, 128])
+def test_bwd_dhu64_long_t_against_fla(K: int):
+    q, k, w, do, dv, h0, dht = _make_inputs(1, 4096, 1, K, use_h0=True, use_dht=True, seed=7)
     scale = 0.125
 
     ref_dh, ref_dh0, ref_dv2 = fla_bwd_dhu(q=q, k=k, w=w, do=do, dv=dv, h0=h0, dht=dht, scale=scale, chunk_size=64)
@@ -98,3 +100,7 @@ def test_bwd_dhu64_rejects_unsupported_options():
     with pytest.raises(NotImplementedError, match="fixed-length"):
         cu_seqlens = torch.tensor([0, 64], dtype=torch.int32, device=q.device)
         cula_bwd_dhu(q=q, k=k, w=w, do=do, dv=dv, h0=h0, dht=dht, cu_seqlens=cu_seqlens)
+
+    q96, k96, w96, do96, dv96, h096, dht96 = _make_inputs(1, 64, 1, 96, use_h0=True, use_dht=True)
+    with pytest.raises(ValueError, match="K in"):
+        cula_bwd_dhu(q=q96, k=k96, w=w96, do=do96, dv=dv96, h0=h096, dht=dht96)

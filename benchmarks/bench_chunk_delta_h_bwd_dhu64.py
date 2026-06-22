@@ -17,12 +17,12 @@
 
 Scope:
   - fixed-length only
-  - K=V=64, chunk_size=64
+  - K in {64, 128}, V=64, chunk_size=64
   - no g/gk
   - optional h0/dht enabled by default
 
 Example:
-  python benchmarks/bench_chunk_delta_h_bwd_dhu64.py --B 1 --H 8 --T 4096 16384
+  python benchmarks/bench_chunk_delta_h_bwd_dhu64.py --B 1 --H 8 --K 128 --T 4096 16384
 """
 
 import argparse
@@ -62,10 +62,10 @@ def accuracy_stats(ref: torch.Tensor, out: torch.Tensor) -> tuple[float, float, 
     return max_abs, mean_abs, rel_max
 
 
-def make_inputs(B: int, T: int, H: int, use_h0: bool, use_dht: bool, seed: int):
+def make_inputs(B: int, T: int, H: int, K: int, use_h0: bool, use_dht: bool, seed: int):
     torch.manual_seed(seed)
     device = "cuda"
-    K = V = 64
+    V = 64
     q = (torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
     k = (torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
     w = (torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
@@ -77,7 +77,7 @@ def make_inputs(B: int, T: int, H: int, use_h0: bool, use_dht: bool, seed: int):
 
 
 def run_one(args, T: int):
-    q, k, w, do, dv, h0, dht = make_inputs(args.B, T, args.H, args.h0, args.dht, args.seed)
+    q, k, w, do, dv, h0, dht = make_inputs(args.B, T, args.H, args.K, args.h0, args.dht, args.seed)
     common = dict(q=q, k=k, w=w, do=do, dv=dv, h0=h0, dht=dht, scale=args.scale, chunk_size=64)
 
     ref_dh, ref_dh0, ref_dv2 = fla_bwd_dhu(**common)
@@ -124,6 +124,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--B", type=int, default=1)
     parser.add_argument("--H", type=int, default=8)
+    parser.add_argument("--K", type=int, choices=(64, 128), default=64)
     parser.add_argument("--T", type=int, nargs="+", default=[4096, 4096 * 4])
     parser.add_argument("--scale", type=float, default=0.125)
     parser.add_argument("--warmup", type=int, default=10)
@@ -143,7 +144,7 @@ def main():
         raise RuntimeError("CUDA is required")
 
     print("chunk_gated_delta_rule_bwd_dhu64: C++ CUTLASS/CuTe path vs FLA Triton")
-    print(f"B={args.B} H={args.H} K=V=64 h0={args.h0} dht={args.dht} warmup={args.warmup} iters={args.iters}")
+    print(f"B={args.B} H={args.H} K={args.K} V=64 h0={args.h0} dht={args.dht} warmup={args.warmup} iters={args.iters}")
     print(f"{'T':>8} {'FLA ms':>10} {'C++ ms':>10} {'speedup':>8} {'dh max':>10} {'dv2 max':>10} {'dh0 max':>10}")
     print("-" * 82)
 

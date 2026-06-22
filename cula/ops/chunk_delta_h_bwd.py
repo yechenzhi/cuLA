@@ -14,8 +14,8 @@
 
 """C++/CUTLASS-CuTe chunk_delta_h backward dH/dU helper.
 
-This module intentionally exposes only the first production target:
-K=V=64, chunk_size=64, fixed-length layout, no g/gk, no transposed state.
+This module intentionally exposes the first production targets:
+K in {64, 128}, V=64, chunk_size=64, fixed-length layout, no g/gk, no transposed state.
 The return order matches FLA's ``chunk_gated_delta_rule_bwd_dhu``:
 ``(dh, dh0, dv2)``.
 """
@@ -28,6 +28,11 @@ import cula.cudac as cula_cuda
 def _check_same_shape(name: str, x: torch.Tensor, ref: torch.Tensor) -> None:
     if x.shape != ref.shape:
         raise ValueError(f"{name}.shape must match q.shape, got {tuple(x.shape)} vs {tuple(ref.shape)}")
+
+
+def _check_btv_shape(name: str, x: torch.Tensor, B: int, T: int, H: int, V: int) -> None:
+    if x.shape != (B, T, H, V):
+        raise ValueError(f"{name}.shape must be {(B, T, H, V)}, got {tuple(x.shape)}")
 
 
 def chunk_gated_delta_rule_bwd_dhu(
@@ -61,8 +66,8 @@ def chunk_gated_delta_rule_bwd_dhu(
         raise ValueError(f"C++ bwd_dhu64 requires chunk_size=64, got {chunk_size}")
     if q.ndim != 4:
         raise ValueError(f"q must have shape [B, T, H, K], got {tuple(q.shape)}")
-    if q.shape[-1] != 64 or do.shape[-1] != 64:
-        raise ValueError(f"C++ bwd_dhu64 requires K=V=64, got K={q.shape[-1]}, V={do.shape[-1]}")
+    if q.shape[-1] not in (64, 128) or do.shape[-1] != 64:
+        raise ValueError(f"C++ bwd_dhu64 requires K in {{64, 128}} and V=64, got K={q.shape[-1]}, V={do.shape[-1]}")
     if q.shape[1] % 64 != 0:
         raise ValueError(f"C++ bwd_dhu64 requires T to be a multiple of 64, got T={q.shape[1]}")
     if q.dtype is not torch.bfloat16:
@@ -72,8 +77,9 @@ def chunk_gated_delta_rule_bwd_dhu(
 
     _check_same_shape("k", k, q)
     _check_same_shape("w", w, q)
-    _check_same_shape("do", do, q)
-    _check_same_shape("dv", dv, q)
+    B, T, H, K = q.shape
+    _check_btv_shape("do", do, B, T, H, 64)
+    _check_btv_shape("dv", dv, B, T, H, 64)
 
     for name, x in (("q", q), ("k", k), ("w", w), ("do", do), ("dv", dv)):
         if x.dtype is not torch.bfloat16:
@@ -83,7 +89,6 @@ def chunk_gated_delta_rule_bwd_dhu(
         if not x.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
 
-    B, _, H, K = q.shape
     expected_state_shape = (B, H, K, 64)
     if h0 is not None:
         if h0.shape != expected_state_shape:
