@@ -12,10 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <optional>
+#include <tuple>
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/nn/functional.h>
 #include <torch/python.h>
+
+#if defined(CULA_SM90A_ENABLED)
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor>
+ChunkGatedDeltaRuleBwdDhu64(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor w,
+    torch::Tensor dO,
+    torch::Tensor dV,
+    std::optional<torch::Tensor> h0,
+    std::optional<torch::Tensor> dht,
+    double scale);
+#endif
 
 #if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
 void
@@ -50,7 +66,7 @@ ChunkKDAFwdRecompWU(
     std::optional<at::Tensor> qg_out);
 #endif
 
-#if defined(CULA_SM90A_ENABLED)
+#if defined(CULA_SM90A_ENABLED) && !defined(CULA_ONLY_BWD_DHU64)
 std::tuple<torch::Tensor, std::optional<torch::Tensor>>
 kda_fwd_prefill(
     std::optional<torch::Tensor> output_,
@@ -70,11 +86,14 @@ kda_fwd_prefill(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "cuLA";
+#if defined(CULA_SM90A_ENABLED)
+    m.def("chunk_gated_delta_rule_bwd_dhu64_cuda", &ChunkGatedDeltaRuleBwdDhu64);
+#endif
 #if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
     m.def("chunk_kda_fwd_intra_cuda", &ChunkKDAFwdIntra);
     m.def("recompute_w_u_cuda", &ChunkKDAFwdRecompWU);
 #endif
-#if defined(CULA_SM90A_ENABLED)
+#if defined(CULA_SM90A_ENABLED) && !defined(CULA_ONLY_BWD_DHU64)
     m.def("kda_fwd_prefill", &kda_fwd_prefill);
 #endif
 }

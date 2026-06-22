@@ -71,6 +71,7 @@ _has_sm100, _has_sm103, _has_sm90 = detect_gpu_archs()
 DISABLE_SM100 = resolve_disable_flag("CULA_DISABLE_SM100", _has_sm100)
 DISABLE_SM103 = resolve_disable_flag("CULA_DISABLE_SM103", _has_sm103)
 DISABLE_SM90 = resolve_disable_flag("CULA_DISABLE_SM90", _has_sm90)
+ONLY_BWD_DHU64 = os.getenv("CULA_ONLY_BWD_DHU64", "0") == "1"
 
 
 def get_nvcc_version() -> tuple[int, int]:
@@ -156,13 +157,15 @@ if not DISABLE_SM100 or not DISABLE_SM103:
         ]
     )
 if not DISABLE_SM90:
-    cuda_sources.extend(
-        [
-            "csrc/api/kda_sm90.cu",
-            "csrc/kda/sm90/kda_fwd_sm90.cu",
-            "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu",
-        ]
-    )
+    cuda_sources.append("csrc/kda/sm90/chunk_delta_bwd_dhu64.cu")
+    if not ONLY_BWD_DHU64:
+        cuda_sources.extend(
+            [
+                "csrc/api/kda_sm90.cu",
+                "csrc/kda/sm90/kda_fwd_sm90.cu",
+                "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu",
+            ]
+        )
 
 ext_modules = []
 ext_modules.append(
@@ -187,6 +190,7 @@ ext_modules.append(
                 "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
                 "-diag-suppress=3189",  # suppress the warning of torch in C++ 20
             ]
+            + (["-DCULA_ONLY_BWD_DHU64"] if ONLY_BWD_DHU64 else [])
             + get_features_args()
             + get_arch_flags()
             + get_nvcc_thread_args()
