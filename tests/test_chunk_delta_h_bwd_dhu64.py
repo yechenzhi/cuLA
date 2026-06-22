@@ -21,6 +21,9 @@ from cula.ops.chunk_delta_h_bwd import chunk_gated_delta_rule_bwd_dhu as cula_bw
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
+ATOL = 1e-2
+RTOL = 1e-2
+
 
 def _make_inputs(B: int, T: int, H: int, K: int = 64, *, use_h0: bool, use_dht: bool, seed: int = 42):
     torch.manual_seed(seed)
@@ -68,11 +71,11 @@ def test_bwd_dhu64_against_fla(B: int, H: int, T: int, K: int, use_h0: bool, use
     )
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(our_dh.float(), ref_dh.float(), atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(our_dv2.float(), ref_dv2.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(our_dh.float(), ref_dh.float(), atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(our_dv2.float(), ref_dv2.float(), atol=ATOL, rtol=RTOL)
     if use_h0:
         assert our_dh0 is not None
-        torch.testing.assert_close(our_dh0.float(), ref_dh0.float(), atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(our_dh0.float(), ref_dh0.float(), atol=ATOL, rtol=RTOL)
     else:
         assert our_dh0 is None
 
@@ -86,9 +89,9 @@ def test_bwd_dhu64_long_t_against_fla(K: int):
     our_dh, our_dh0, our_dv2 = cula_bwd_dhu(q=q, k=k, w=w, do=do, dv=dv, h0=h0, dht=dht, scale=scale, chunk_size=64)
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(our_dh.float(), ref_dh.float(), atol=3e-2, rtol=3e-2)
-    torch.testing.assert_close(our_dv2.float(), ref_dv2.float(), atol=3e-2, rtol=3e-2)
-    torch.testing.assert_close(our_dh0.float(), ref_dh0.float(), atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(our_dh.float(), ref_dh.float(), atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(our_dv2.float(), ref_dv2.float(), atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(our_dh0.float(), ref_dh0.float(), atol=ATOL, rtol=RTOL)
 
 
 def test_bwd_dhu64_h64_k128_against_fla():
@@ -99,9 +102,9 @@ def test_bwd_dhu64_h64_k128_against_fla():
     our_dh, our_dh0, our_dv2 = cula_bwd_dhu(q=q, k=k, w=w, do=do, dv=dv, h0=h0, dht=dht, scale=scale, chunk_size=64)
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(our_dh.float(), ref_dh.float(), atol=3e-2, rtol=3e-2)
-    torch.testing.assert_close(our_dv2.float(), ref_dv2.float(), atol=3e-2, rtol=3e-2)
-    torch.testing.assert_close(our_dh0.float(), ref_dh0.float(), atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(our_dh.float(), ref_dh.float(), atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(our_dv2.float(), ref_dv2.float(), atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(our_dh0.float(), ref_dh0.float(), atol=ATOL, rtol=RTOL)
 
 
 def test_bwd_dhu64_rejects_unsupported_options():
