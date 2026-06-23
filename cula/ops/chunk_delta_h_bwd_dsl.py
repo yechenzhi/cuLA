@@ -67,42 +67,6 @@ def _warpgroup_fence_operand_f32(x: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @cutlass.dsl_user_op
-def _fadd_rn_ftz_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
-    result = _llvm.inline_asm(
-        _T.f32(),
-        [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
-        "add.rn.ftz.f32 $0, $1, $2;",
-        "=f,f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return Float32(result)
-
-
-@cutlass.dsl_user_op
-def _ffma_rn_ftz_f32(a: Float32, b: Float32, c: Float32, *, loc=None, ip=None) -> Float32:
-    result = _llvm.inline_asm(
-        _T.f32(),
-        [
-            Float32(a).ir_value(loc=loc, ip=ip),
-            Float32(b).ir_value(loc=loc, ip=ip),
-            Float32(c).ir_value(loc=loc, ip=ip),
-        ],
-        "fma.rn.ftz.f32 $0, $1, $2, $3;",
-        "=f,f,f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return Float32(result)
-
-
-@cutlass.dsl_user_op
 def _store_bridge_64x32_bf16(
     tidx: Int32,
     smem_base: Int32,
@@ -1145,11 +1109,11 @@ class ChunkDeltaBwdDhuSm90:
     ):
         vals0 = _load_acc_64x32_bf16_from_smem_bridge(tidx, smem_ptr.toint())
         for i in cutlass.range_constexpr(16):
-            acc[i] = _fadd_rn_ftz_f32(acc[i], vals0[i])
+            acc[i] += vals0[i]
 
         vals1 = _load_acc_64x32_bf16_from_smem_bridge(tidx, smem_ptr.toint() + BT * 32 * 2)
         for i in cutlass.range_constexpr(16):
-            acc[i + 16] = _fadd_rn_ftz_f32(acc[i + 16], vals1[i])
+            acc[i + 16] += vals1[i]
 
     @cute.jit
     def _add_dv_bridge_64x32_from_smem(
@@ -1160,7 +1124,7 @@ class ChunkDeltaBwdDhuSm90:
     ):
         vals = _load_acc_64x32_bf16_from_smem_bridge(tidx, smem_ptr.toint())
         for i in cutlass.range_constexpr(16):
-            acc[i] = _fadd_rn_ftz_f32(acc[i], vals[i])
+            acc[i] += vals[i]
 
     @cute.jit
     def _prefetch_bv32(
@@ -1803,10 +1767,8 @@ class ChunkDeltaBwdDhuSm90:
             self._fence_acc(acc_wdv1)
 
             for i in cutlass.range_constexpr(cute.size(state0)):
-                update0 = _ffma_rn_ftz_f32(acc_qdo0[i], scale, -acc_wdv0[i])
-                update1 = _ffma_rn_ftz_f32(acc_qdo1[i], scale, -acc_wdv1[i])
-                state0[i] = _fadd_rn_ftz_f32(state0[i], update0)
-                state1[i] = _fadd_rn_ftz_f32(state1[i], update1)
+                state0[i] += acc_qdo0[i] * scale - acc_wdv0[i]
+                state1[i] += acc_qdo1[i] * scale - acc_wdv1[i]
 
             if cutlass.const_expr(self.BV == 32):
                 prefetch_iter = iter_idx + 2
