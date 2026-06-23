@@ -264,6 +264,151 @@ def _store_bridge_64x64_postbar_bf16(
 
 
 @cutlass.dsl_user_op
+def _store_dh0_float4_64x64(
+    tidx: Int32,
+    smem_base: Int32,
+    gmem_base,
+    row_stride_bytes: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    _llvm.inline_asm(
+        _T.i32(),
+        [
+            Int32(tidx).ir_value(loc=loc, ip=ip),
+            Int32(smem_base).ir_value(loc=loc, ip=ip),
+            gmem_base.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            Int32(row_stride_bytes).ir_value(loc=loc, ip=ip),
+        ],
+        """{
+        .reg .u32 t, vec, row, col, smem_off, col_bytes;
+        .reg .u32 a0, a1, a2, a3;
+        .reg .u64 g0, row_bytes, col_bytes64;
+        mov.u32 t, $1;
+
+        mov.u32 vec, t;
+        shr.u32 row, vec, 4;
+        and.b32 col, vec, 15;
+        shl.b32 col, col, 2;
+        shl.b32 smem_off, vec, 4;
+        mul.wide.u32 row_bytes, row, $4;
+        shl.b32 col_bytes, col, 2;
+        cvt.u64.u32 col_bytes64, col_bytes;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes64;
+        add.u32 smem_off, $2, smem_off;
+        ld.shared.v4.b32 {a0, a1, a2, a3}, [smem_off];
+        st.global.v4.b32 [g0], {a0, a1, a2, a3};
+
+        add.u32 vec, t, 128;
+        shr.u32 row, vec, 4;
+        and.b32 col, vec, 15;
+        shl.b32 col, col, 2;
+        shl.b32 smem_off, vec, 4;
+        mul.wide.u32 row_bytes, row, $4;
+        shl.b32 col_bytes, col, 2;
+        cvt.u64.u32 col_bytes64, col_bytes;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes64;
+        add.u32 smem_off, $2, smem_off;
+        ld.shared.v4.b32 {a0, a1, a2, a3}, [smem_off];
+        st.global.v4.b32 [g0], {a0, a1, a2, a3};
+
+        add.u32 vec, t, 256;
+        shr.u32 row, vec, 4;
+        and.b32 col, vec, 15;
+        shl.b32 col, col, 2;
+        shl.b32 smem_off, vec, 4;
+        mul.wide.u32 row_bytes, row, $4;
+        shl.b32 col_bytes, col, 2;
+        cvt.u64.u32 col_bytes64, col_bytes;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes64;
+        add.u32 smem_off, $2, smem_off;
+        ld.shared.v4.b32 {a0, a1, a2, a3}, [smem_off];
+        st.global.v4.b32 [g0], {a0, a1, a2, a3};
+
+        add.u32 vec, t, 384;
+        shr.u32 row, vec, 4;
+        and.b32 col, vec, 15;
+        shl.b32 col, col, 2;
+        shl.b32 smem_off, vec, 4;
+        mul.wide.u32 row_bytes, row, $4;
+        shl.b32 col_bytes, col, 2;
+        cvt.u64.u32 col_bytes64, col_bytes;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes64;
+        add.u32 smem_off, $2, smem_off;
+        ld.shared.v4.b32 {a0, a1, a2, a3}, [smem_off];
+        st.global.v4.b32 [g0], {a0, a1, a2, a3};
+
+        add.u32 vec, t, 512;
+        shr.u32 row, vec, 4;
+        and.b32 col, vec, 15;
+        shl.b32 col, col, 2;
+        shl.b32 smem_off, vec, 4;
+        mul.wide.u32 row_bytes, row, $4;
+        shl.b32 col_bytes, col, 2;
+        cvt.u64.u32 col_bytes64, col_bytes;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes64;
+        add.u32 smem_off, $2, smem_off;
+        ld.shared.v4.b32 {a0, a1, a2, a3}, [smem_off];
+        st.global.v4.b32 [g0], {a0, a1, a2, a3};
+
+        add.u32 vec, t, 640;
+        shr.u32 row, vec, 4;
+        and.b32 col, vec, 15;
+        shl.b32 col, col, 2;
+        shl.b32 smem_off, vec, 4;
+        mul.wide.u32 row_bytes, row, $4;
+        shl.b32 col_bytes, col, 2;
+        cvt.u64.u32 col_bytes64, col_bytes;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes64;
+        add.u32 smem_off, $2, smem_off;
+        ld.shared.v4.b32 {a0, a1, a2, a3}, [smem_off];
+        st.global.v4.b32 [g0], {a0, a1, a2, a3};
+
+        add.u32 vec, t, 768;
+        shr.u32 row, vec, 4;
+        and.b32 col, vec, 15;
+        shl.b32 col, col, 2;
+        shl.b32 smem_off, vec, 4;
+        mul.wide.u32 row_bytes, row, $4;
+        shl.b32 col_bytes, col, 2;
+        cvt.u64.u32 col_bytes64, col_bytes;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes64;
+        add.u32 smem_off, $2, smem_off;
+        ld.shared.v4.b32 {a0, a1, a2, a3}, [smem_off];
+        st.global.v4.b32 [g0], {a0, a1, a2, a3};
+
+        add.u32 vec, t, 896;
+        shr.u32 row, vec, 4;
+        and.b32 col, vec, 15;
+        shl.b32 col, col, 2;
+        shl.b32 smem_off, vec, 4;
+        mul.wide.u32 row_bytes, row, $4;
+        shl.b32 col_bytes, col, 2;
+        cvt.u64.u32 col_bytes64, col_bytes;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes64;
+        add.u32 smem_off, $2, smem_off;
+        ld.shared.v4.b32 {a0, a1, a2, a3}, [smem_off];
+        st.global.v4.b32 [g0], {a0, a1, a2, a3};
+        }""",
+        "=r,r,r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cutlass.dsl_user_op
 def _cp_async_do_mn_sw128_64x64(
     tidx: Int32,
     smem_base: Int32,
@@ -566,7 +711,15 @@ class ChunkDeltaBwdDhuSm90:
                 sDo[v_rel + j, t_rel, 0] = gDo[v_rel + j, t_rel]
 
     @cute.jit
-    def _store_dh0_tile(self, acc: cute.Tensor, tC: cute.Tensor, sDh0: cute.Tensor, gDh0: cute.Tensor, tidx: Int32):
+    def _store_dh0_tile(
+        self,
+        acc: cute.Tensor,
+        tC: cute.Tensor,
+        sDh0: cute.Tensor,
+        gDh0: cute.Tensor,
+        row_stride_bytes: Int32,
+        tidx: Int32,
+    ):
         for i in cutlass.range_constexpr(cute.size(acc)):
             coord = tC[i]
             row = coord[0]
@@ -574,12 +727,15 @@ class ChunkDeltaBwdDhuSm90:
             sDh0[row, col] = acc[i]
         cute.arch.sync_threads()
 
-        for store_iter in cutlass.range_constexpr((BK * self.BV) // (4 * self.threads_per_cta)):
-            elem = (tidx + store_iter * self.threads_per_cta) * 4
-            row = elem // self.BV
-            col = elem - row * self.BV
-            for j in cutlass.range_constexpr(4):
-                gDh0[row, col + j] = sDh0[row, col + j]
+        if cutlass.const_expr(self.BV == 64):
+            _store_dh0_float4_64x64(tidx, sDh0.iterator.toint(), gDh0.iterator, row_stride_bytes)
+        else:
+            for store_iter in cutlass.range_constexpr((BK * self.BV) // (4 * self.threads_per_cta)):
+                elem = (tidx + store_iter * self.threads_per_cta) * 4
+                row = elem // self.BV
+                col = elem - row * self.BV
+                for j in cutlass.range_constexpr(4):
+                    gDh0[row, col + j] = sDh0[row, col + j]
         cute.arch.sync_threads()
 
     @cute.jit
@@ -1153,8 +1309,8 @@ class ChunkDeltaBwdDhuSm90:
             dh0_base = ((b * H + h) * K) * V + v_base
             gDh00 = cute.make_tensor(dh0_ptr + dh0_base, cute.make_layout((BK, self.BV), stride=(V, 1)))
             gDh01 = cute.make_tensor(dh0_ptr + dh0_base + BK * V, cute.make_layout((BK, self.BV), stride=(V, 1)))
-            self._store_dh0_tile(state0, tCUpdate, sDh0Float, gDh00, tidx)
-            self._store_dh0_tile(state1, tCUpdate, sDh0Float, gDh01, tidx)
+            self._store_dh0_tile(state0, tCUpdate, sDh0Float, gDh00, V * 4, tidx)
+            self._store_dh0_tile(state1, tCUpdate, sDh0Float, gDh01, V * 4, tidx)
 
 
 def _compile_variant(H: int, BV: int, use_fast_math: bool):
