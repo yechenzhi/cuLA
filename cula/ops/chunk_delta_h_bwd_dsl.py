@@ -264,6 +264,106 @@ def _store_bridge_64x64_postbar_bf16(
 
 
 @cutlass.dsl_user_op
+def _cp_async_do_mn_sw128_64x64(
+    tidx: Int32,
+    smem_base: Int32,
+    gmem_base,
+    row_stride_bytes: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    _llvm.inline_asm(
+        _T.i32(),
+        [
+            Int32(tidx).ir_value(loc=loc, ip=ip),
+            Int32(smem_base).ir_value(loc=loc, ip=ip),
+            gmem_base.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            Int32(row_stride_bytes).ir_value(loc=loc, ip=ip),
+        ],
+        """{
+        .reg .u32 t, vec, row, col, linear_bytes, swz, smem_off, s0;
+        .reg .u64 g0, row_bytes, col_bytes;
+        mov.u32 t, $1;
+
+        mov.u32 vec, t;
+        shr.u32 row, vec, 3;
+        and.b32 col, vec, 7;
+        shl.b32 col, col, 3;
+        mul.wide.u32 row_bytes, row, $4;
+        mul.wide.u32 col_bytes, col, 2;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes;
+        shl.b32 linear_bytes, row, 7;
+        shl.b32 smem_off, col, 1;
+        add.u32 linear_bytes, linear_bytes, smem_off;
+        and.b32 swz, linear_bytes, 896;
+        shr.u32 swz, swz, 3;
+        xor.b32 smem_off, linear_bytes, swz;
+        add.u32 s0, $2, smem_off;
+        cp.async.cg.shared.global.L2::128B [s0], [g0], 16;
+
+        add.u32 vec, t, 128;
+        shr.u32 row, vec, 3;
+        and.b32 col, vec, 7;
+        shl.b32 col, col, 3;
+        mul.wide.u32 row_bytes, row, $4;
+        mul.wide.u32 col_bytes, col, 2;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes;
+        shl.b32 linear_bytes, row, 7;
+        shl.b32 smem_off, col, 1;
+        add.u32 linear_bytes, linear_bytes, smem_off;
+        and.b32 swz, linear_bytes, 896;
+        shr.u32 swz, swz, 3;
+        xor.b32 smem_off, linear_bytes, swz;
+        add.u32 s0, $2, smem_off;
+        cp.async.cg.shared.global.L2::128B [s0], [g0], 16;
+
+        add.u32 vec, t, 256;
+        shr.u32 row, vec, 3;
+        and.b32 col, vec, 7;
+        shl.b32 col, col, 3;
+        mul.wide.u32 row_bytes, row, $4;
+        mul.wide.u32 col_bytes, col, 2;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes;
+        shl.b32 linear_bytes, row, 7;
+        shl.b32 smem_off, col, 1;
+        add.u32 linear_bytes, linear_bytes, smem_off;
+        and.b32 swz, linear_bytes, 896;
+        shr.u32 swz, swz, 3;
+        xor.b32 smem_off, linear_bytes, swz;
+        add.u32 s0, $2, smem_off;
+        cp.async.cg.shared.global.L2::128B [s0], [g0], 16;
+
+        add.u32 vec, t, 384;
+        shr.u32 row, vec, 3;
+        and.b32 col, vec, 7;
+        shl.b32 col, col, 3;
+        mul.wide.u32 row_bytes, row, $4;
+        mul.wide.u32 col_bytes, col, 2;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes;
+        shl.b32 linear_bytes, row, 7;
+        shl.b32 smem_off, col, 1;
+        add.u32 linear_bytes, linear_bytes, smem_off;
+        and.b32 swz, linear_bytes, 896;
+        shr.u32 swz, swz, 3;
+        xor.b32 smem_off, linear_bytes, swz;
+        add.u32 s0, $2, smem_off;
+        cp.async.cg.shared.global.L2::128B [s0], [g0], 16;
+        }""",
+        "=r,r,r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cutlass.dsl_user_op
 def _cp_async_dv_bridge_64x32(
     tidx: Int32,
     smem_base: Int32,
@@ -866,8 +966,13 @@ class ChunkDeltaBwdDhuSm90:
             cute.copy(copy_mn, copy_mn_thr.partition_S(gQ0), copy_mn_thr.partition_D(sQ0)[None, None, None, 0])
             cute.copy(copy_mn, copy_mn_thr.partition_S(gW1), copy_mn_thr.partition_D(sW1)[None, None, None, 0])
             cute.copy(copy_mn, copy_mn_thr.partition_S(gQ1), copy_mn_thr.partition_D(sQ1)[None, None, None, 0])
-            self._copy_do_tile(gDo, sDo, tidx)
             if cutlass.const_expr(self.BV == 64):
+                _cp_async_do_mn_sw128_64x64(
+                    tidx,
+                    sDoRaw.iterator.toint(),
+                    do_ptr + base_v,
+                    H * V * 2,
+                )
                 self._cp_async_dv_bridge_64x64(
                     tidx,
                     sDvPrefRaw.iterator,
@@ -875,6 +980,8 @@ class ChunkDeltaBwdDhuSm90:
                     H * V * 2,
                 )
                 cute.arch.cp_async_commit_group()
+            else:
+                self._copy_do_tile(gDo, sDo, tidx)
             cute.arch.sync_threads()
 
             dh_base = (((b * NT + chunk) * H + h) * K) * V + v_base
