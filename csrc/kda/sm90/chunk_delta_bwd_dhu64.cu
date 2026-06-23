@@ -175,6 +175,115 @@ store_bridge_64x32_bf16(
         : "memory");
 }
 
+__device__ __forceinline__ void
+store_bridge_64x64_postbar_bf16(
+    int tidx,
+    uint32_t smem_base,
+    uint64_t gmem_base,
+    uint32_t row_stride_bytes,
+    uint32_t p0,
+    uint32_t p1,
+    uint32_t p2,
+    uint32_t p3,
+    uint32_t p4,
+    uint32_t p5,
+    uint32_t p6,
+    uint32_t p7,
+    uint32_t p8,
+    uint32_t p9,
+    uint32_t p10,
+    uint32_t p11,
+    uint32_t p12,
+    uint32_t p13,
+    uint32_t p14,
+    uint32_t p15) {
+    asm volatile(
+        "{\n"
+        ".reg .u32 r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15;\n"
+        ".reg .u32 r16, r17;\n"
+        ".reg .u32 s0, s1, l0, l1, l2, l3;\n"
+        ".reg .u32 o0, o1, o2, o3, o4, o5, o6, o7;\n"
+        ".reg .u32 o8, o9, o10, o11, o12, o13, o14, o15;\n"
+        ".reg .u32 row, col;\n"
+        ".reg .u64 g0, g1, g2, g3, row_bytes, col_bytes, step_bytes;\n"
+        "mov.u32 r5, %0;\n"
+        "and.b32 r6, r5, 24;\n"
+        "shl.b32 r6, r6, 7;\n"
+        "and.b32 r7, r5, 3;\n"
+        "shl.b32 r7, r7, 5;\n"
+        "or.b32 r8, r6, r7;\n"
+        "and.b32 r9, r5, 96;\n"
+        "shl.b32 r9, r9, 3;\n"
+        "shl.b32 r10, r5, 2;\n"
+        "and.b32 r10, r10, 112;\n"
+        "or.b32 r11, r9, r10;\n"
+        "xor.b32 r12, r8, r11;\n"
+        "add.u32 s0, %1, r12;\n"
+        "add.u32 s1, s0, 4096;\n"
+        "shr.u32 row, r5, 2;\n"
+        "and.b32 row, row, 31;\n"
+        "and.b32 col, r5, 3;\n"
+        "shl.b32 col, col, 3;\n"
+        "mul.wide.u32 row_bytes, row, %3;\n"
+        "mul.wide.u32 col_bytes, col, 2;\n"
+        "add.u64 g0, %2, row_bytes;\n"
+        "add.u64 g0, g0, col_bytes;\n"
+        "mul.wide.u32 step_bytes, %3, 32;\n"
+        "add.u64 g1, g0, step_bytes;\n"
+        "add.u64 g2, g0, 64;\n"
+        "add.u64 g3, g1, 64;\n"
+        "st.shared.v4.b32 [s0], {%4, %6, %8, %10};\n"
+        "st.shared.v4.b32 [s0+128], {%5, %7, %9, %11};\n"
+        "st.shared.v4.b32 [s1], {%12, %14, %16, %18};\n"
+        "st.shared.v4.b32 [s1+128], {%13, %15, %17, %19};\n"
+        "fence.proxy.async.shared::cta;\n"
+        "bar.sync 0;\n"
+        "and.b32 r13, r5, 6;\n"
+        "shl.b32 r13, r13, 9;\n"
+        "and.b32 r14, r5, 7;\n"
+        "shl.b32 r14, r14, 4;\n"
+        "or.b32 r15, r13, r14;\n"
+        "and.b32 r16, r5, 120;\n"
+        "shl.b32 r16, r16, 2;\n"
+        "xor.b32 r17, r15, r16;\n"
+        "add.u32 l0, %1, r17;\n"
+        "add.u32 l1, l0, 512;\n"
+        "add.u32 l2, l0, 4096;\n"
+        "add.u32 l3, l2, 512;\n"
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {o0, o1, o2, o3}, [l0];\n"
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {o4, o5, o6, o7}, [l1];\n"
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {o8, o9, o10, o11}, [l2];\n"
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {o12, o13, o14, o15}, [l3];\n"
+        "st.global.v4.b32 [g0], {o0, o1, o2, o3};\n"
+        "st.global.v4.b32 [g1], {o4, o5, o6, o7};\n"
+        "st.global.v4.b32 [g2], {o8, o9, o10, o11};\n"
+        "st.global.v4.b32 [g3], {o12, o13, o14, o15};\n"
+        "bar.sync 0;\n"
+        "}\n"
+        :
+        : "r"(tidx),
+          "r"(smem_base),
+          "l"(gmem_base),
+          "r"(row_stride_bytes),
+          "r"(p0),
+          "r"(p1),
+          "r"(p2),
+          "r"(p3),
+          "r"(p4),
+          "r"(p5),
+          "r"(p6),
+          "r"(p7),
+          "r"(p8),
+          "r"(p9),
+          "r"(p10),
+          "r"(p11),
+          "r"(p12),
+          "r"(p13),
+          "r"(p14),
+          "r"(p15)
+        : "memory");
+}
+
 template <typename AccFrag>
 CUTE_DEVICE void
 store_acc_64x32_bf16(int tid, Element* smem_store, Element* gmem, uint32_t row_stride_bytes, AccFrag const& acc) {
@@ -248,6 +357,50 @@ store_bf16frag_64x64(int tid, Element* smem_store, Element* gmem, uint32_t row_s
     }
 }
 
+template <typename Bf16Frag>
+CUTE_DEVICE void
+store_bf16frag_64x64_postbar(
+    int tid, Element* smem_store, Element* gmem, uint32_t row_stride_bytes, Bf16Frag const& bf16) {
+    uint32_t p0 = pack_bf16x2_raw(bf16(0), bf16(1));
+    uint32_t p1 = pack_bf16x2_raw(bf16(2), bf16(3));
+    uint32_t p2 = pack_bf16x2_raw(bf16(4), bf16(5));
+    uint32_t p3 = pack_bf16x2_raw(bf16(6), bf16(7));
+    uint32_t p4 = pack_bf16x2_raw(bf16(8), bf16(9));
+    uint32_t p5 = pack_bf16x2_raw(bf16(10), bf16(11));
+    uint32_t p6 = pack_bf16x2_raw(bf16(12), bf16(13));
+    uint32_t p7 = pack_bf16x2_raw(bf16(14), bf16(15));
+    uint32_t p8 = pack_bf16x2_raw(bf16(16), bf16(17));
+    uint32_t p9 = pack_bf16x2_raw(bf16(18), bf16(19));
+    uint32_t p10 = pack_bf16x2_raw(bf16(20), bf16(21));
+    uint32_t p11 = pack_bf16x2_raw(bf16(22), bf16(23));
+    uint32_t p12 = pack_bf16x2_raw(bf16(24), bf16(25));
+    uint32_t p13 = pack_bf16x2_raw(bf16(26), bf16(27));
+    uint32_t p14 = pack_bf16x2_raw(bf16(28), bf16(29));
+    uint32_t p15 = pack_bf16x2_raw(bf16(30), bf16(31));
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_store));
+    store_bridge_64x64_postbar_bf16(
+        tid,
+        smem_addr,
+        reinterpret_cast<uint64_t>(gmem),
+        row_stride_bytes,
+        p0,
+        p1,
+        p2,
+        p3,
+        p4,
+        p5,
+        p6,
+        p7,
+        p8,
+        p9,
+        p10,
+        p11,
+        p12,
+        p13,
+        p14,
+        p15);
+}
+
 template <typename TiledMma, typename TiledCopy, typename ThrCopy, typename AccFrag, typename STile>
 CUTE_DEVICE void
 r2s_acc_store(
@@ -290,6 +443,28 @@ r2s_acc_store_64x64(
     }
     copy(r2s, r2s_thr.retile_S(bf16), r2s_thr.partition_D(sTile(_, _, _0{})));
     store_bf16frag_64x64(tid, smem_store, gmem, row_stride_bytes, bf16);
+}
+
+template <typename TiledMma, typename TiledCopy, typename ThrCopy, typename AccFrag, typename STile>
+CUTE_DEVICE void
+r2s_acc_store_64x64_postbar(
+    TiledMma const& tiled_mma,
+    TiledCopy const& r2s,
+    ThrCopy const& r2s_thr,
+    AccFrag const& acc,
+    STile const& sTile,
+    int tid,
+    Element* smem_store,
+    Element* gmem,
+    uint32_t row_stride_bytes) {
+    (void)tiled_mma;
+    Tensor bf16 = make_fragment_like<Element>(acc);
+    CUTE_UNROLL
+    for (int i = 0; i < size(bf16); ++i) {
+        bf16(i) = Element(acc(i));
+    }
+    copy(r2s, r2s_thr.retile_S(bf16), r2s_thr.partition_D(sTile(_, _, _0{})));
+    store_bf16frag_64x64_postbar(tid, smem_store, gmem, row_stride_bytes, bf16);
 }
 
 template <typename STile>
@@ -908,7 +1083,7 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_v
             acc_dv(i) += acc_dv_in(i);
         }
 
-        r2s_acc_store_64x64(
+        r2s_acc_store_64x64_postbar(
             kdh_mma,
             r2s_kdh,
             r2s_kdh_thr,
