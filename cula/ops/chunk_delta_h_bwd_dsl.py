@@ -1123,9 +1123,6 @@ class ChunkDeltaBwdDhuSm90:
         sDvPref_ptr: cute.Pointer,
         b: Int32,
         h: Int32,
-        H: Int32,
-        K: Int32,
-        V: Int32,
         T: Int32,
         v_base: Int32,
         chunk: Int32,
@@ -1134,13 +1131,13 @@ class ChunkDeltaBwdDhuSm90:
         stage = prefetch_iter % 3
         dv_stage = prefetch_iter % 2
         t0 = chunk * BT
-        base_k = ((b * T + t0) * H + h) * K
-        base_v = ((b * T + t0) * H + h) * V + v_base
+        base_k = ((b * T + t0) * self.H_static + h) * K_DIM
+        base_v = ((b * T + t0) * self.H_static + h) * V_DIM + v_base
         k_stage_off = stage * (BT * BK)
         v_stage_off = stage * (BT * self.BV)
         dv_stage_off = dv_stage * (BT * self.BV)
-        k_row_stride_bytes = H * K * 2
-        v_row_stride_bytes = H * V * 2
+        k_row_stride_bytes = Int32(self.H_static * K_DIM * 2)
+        v_row_stride_bytes = Int32(self.H_static * V_DIM * 2)
 
         _cp_async_k_sw128_64x64(
             tidx,
@@ -1340,7 +1337,7 @@ class ChunkDeltaBwdDhuSm90:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         v_tile, bh, _ = cute.arch.block_idx()
-        B, T, H, K, V = problem_size
+        B, T, H, _, _ = problem_size
         NT = T // BT
         if cutlass.const_expr(self.H_static == 64):
             b = bh >> 6
@@ -1492,7 +1489,10 @@ class ChunkDeltaBwdDhuSm90:
         state1 = update_thr.make_fragment_C(update_c_shape)
         dht = cute.make_tensor(
             dht_ptr,
-            cute.make_layout((K, V, (H, B)), stride=(V, 1, (K * V, H * K * V))),
+            cute.make_layout(
+                (K_DIM, V_DIM, (self.H_static, B)),
+                stride=(V_DIM, 1, (K_DIM * V_DIM, self.H_static * K_DIM * V_DIM)),
+            ),
         )
 
         if has_dht != 0:
@@ -1527,9 +1527,6 @@ class ChunkDeltaBwdDhuSm90:
                     sDvPrefRaw.iterator,
                     b,
                     h,
-                    H,
-                    K,
-                    V,
                     T,
                     v_base,
                     NT - Int32(1) - pref,
@@ -1540,12 +1537,12 @@ class ChunkDeltaBwdDhuSm90:
         for iter_idx in cutlass.range(NT):
             chunk = NT - Int32(1) - iter_idx
             t0 = chunk * BT
-            base_k = ((b * T + t0) * H + h) * K
-            base_v = ((b * T + t0) * H + h) * V + v_base
+            base_k = ((b * T + t0) * self.H_static + h) * K_DIM
+            base_v = ((b * T + t0) * self.H_static + h) * V_DIM + v_base
 
             if cutlass.const_expr(self.BV == 64):
-                k_row_stride_bytes = H * K * 2
-                v_row_stride_bytes = H * V * 2
+                k_row_stride_bytes = Int32(self.H_static * K_DIM * 2)
+                v_row_stride_bytes = Int32(self.H_static * V_DIM * 2)
                 _cp_async_k_sw128_64x64(tidx, sK0Raw.iterator.toint(), k_ptr + base_k, k_row_stride_bytes)
                 _cp_async_k_sw128_64x64(tidx, sK1Raw.iterator.toint(), k_ptr + base_k + BK, k_row_stride_bytes)
                 _cp_async_mn_sw128_64x64(tidx, sW0Raw.iterator.toint(), w_ptr + base_k, k_row_stride_bytes)
@@ -1561,7 +1558,7 @@ class ChunkDeltaBwdDhuSm90:
                     v_row_stride_bytes,
                 )
                 cute.arch.cp_async_commit_group()
-            dh_base = (((b * NT + chunk) * H + h) * K) * V + v_base
+            dh_base = (((b * NT + chunk) * self.H_static + h) * K_DIM) * V_DIM + v_base
             self._r2s_acc_store_bridge(
                 state0,
                 r2s_update,
@@ -1569,7 +1566,7 @@ class ChunkDeltaBwdDhuSm90:
                 sDh0Store,
                 sDhBridgeRaw.iterator,
                 dh_ptr + dh_base,
-                V * 2,
+                Int32(V_DIM * 2),
                 tidx,
             )
             self._r2s_acc_store_bridge(
@@ -1578,8 +1575,8 @@ class ChunkDeltaBwdDhuSm90:
                 r2s_update_thr,
                 sDh1Store,
                 sDh1BridgeRaw.iterator,
-                dh_ptr + dh_base + BK * V,
-                V * 2,
+                dh_ptr + dh_base + BK * V_DIM,
+                Int32(V_DIM * 2),
                 tidx,
             )
             if cutlass.const_expr(self.BV == 32):
@@ -1657,7 +1654,7 @@ class ChunkDeltaBwdDhuSm90:
                     sDv2Store,
                     sDhBridgeRaw.iterator,
                     dv2_ptr + base_v,
-                    H * V * 2,
+                    Int32(self.H_static * V_DIM * 2),
                     tidx,
                 )
             else:
@@ -1668,7 +1665,7 @@ class ChunkDeltaBwdDhuSm90:
                     sDv2Store,
                     sDv2BridgeRaw.iterator,
                     dv2_ptr + base_v,
-                    H * V * 2,
+                    Int32(self.H_static * V_DIM * 2),
                     tidx,
                 )
 
@@ -1764,9 +1761,6 @@ class ChunkDeltaBwdDhuSm90:
                         sDvPrefRaw.iterator,
                         b,
                         h,
-                        H,
-                        K,
-                        V,
                         T,
                         v_base,
                         NT - Int32(1) - prefetch_iter,
@@ -1775,11 +1769,11 @@ class ChunkDeltaBwdDhuSm90:
                     pending_groups += 2
 
         if store_dh0 != 0:
-            dh0_base = ((b * H + h) * K) * V + v_base
-            gDh00 = cute.make_tensor(dh0_ptr + dh0_base, cute.make_layout((BK, self.BV), stride=(V, 1)))
-            gDh01 = cute.make_tensor(dh0_ptr + dh0_base + BK * V, cute.make_layout((BK, self.BV), stride=(V, 1)))
-            self._store_dh0_tile(state0, tCUpdate, sDh0Float, gDh00, V * 4, tidx)
-            self._store_dh0_tile(state1, tCUpdate, sDh0Float, gDh01, V * 4, tidx)
+            dh0_base = ((b * self.H_static + h) * K_DIM) * V_DIM + v_base
+            gDh00 = cute.make_tensor(dh0_ptr + dh0_base, cute.make_layout((BK, self.BV), stride=(V_DIM, 1)))
+            gDh01 = cute.make_tensor(dh0_ptr + dh0_base + BK * V_DIM, cute.make_layout((BK, self.BV), stride=(V_DIM, 1)))
+            self._store_dh0_tile(state0, tCUpdate, sDh0Float, gDh00, Int32(V_DIM * 4), tidx)
+            self._store_dh0_tile(state1, tCUpdate, sDh0Float, gDh01, Int32(V_DIM * 4), tidx)
 
 
 def _compile_variant(H: int, BV: int, use_fast_math: bool):
