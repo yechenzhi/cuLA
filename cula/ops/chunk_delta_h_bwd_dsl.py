@@ -1362,7 +1362,7 @@ class ChunkDeltaBwdDhuSm90:
             grid=(V // self.BV, B * H, 1),
             block=[self.threads_per_cta, 1, 1],
             stream=stream,
-            min_blocks_per_mp=1,
+            min_blocks_per_mp=4 if self.BV == 32 else 1,
         )
 
     @cute.kernel
@@ -1896,11 +1896,10 @@ def _compile_variant(H: int, BV: int, use_fast_math: bool):
 
 
 def _select_bv(B: int, H: int, V: int = V_DIM, sm_count: int | None = None) -> int:
+    del B, sm_count
     if V != V_DIM:
         raise ValueError(f"CuTeDSL bwd_dhu requires V={V_DIM}, got V={V}")
-    if sm_count is None:
-        sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    return 64 if sm_count <= B * H * (V // 64) else 32
+    return 64 if H >= 32 else 32
 
 
 def _get_compiled(H: int, BV: int):
