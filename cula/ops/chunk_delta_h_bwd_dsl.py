@@ -409,7 +409,7 @@ def _store_dh0_float4_64x64(
 
 
 @cutlass.dsl_user_op
-def _cp_async_do_mn_sw128_64x64(
+def _cp_async_mn_sw128_64x64(
     tidx: Int32,
     smem_base: Int32,
     gmem_base,
@@ -486,6 +486,97 @@ def _cp_async_do_mn_sw128_64x64(
         shr.u32 row, vec, 3;
         and.b32 col, vec, 7;
         shl.b32 col, col, 3;
+        mul.wide.u32 row_bytes, row, $4;
+        mul.wide.u32 col_bytes, col, 2;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes;
+        shl.b32 linear_bytes, row, 7;
+        shl.b32 smem_off, col, 1;
+        add.u32 linear_bytes, linear_bytes, smem_off;
+        and.b32 swz, linear_bytes, 896;
+        shr.u32 swz, swz, 3;
+        xor.b32 smem_off, linear_bytes, swz;
+        add.u32 s0, $2, smem_off;
+        cp.async.cg.shared.global.L2::128B [s0], [g0], 16;
+        }""",
+        "=r,r,r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cutlass.dsl_user_op
+def _cp_async_k_sw128_64x64(
+    tidx: Int32,
+    smem_base: Int32,
+    gmem_base,
+    row_stride_bytes: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    _llvm.inline_asm(
+        _T.i32(),
+        [
+            Int32(tidx).ir_value(loc=loc, ip=ip),
+            Int32(smem_base).ir_value(loc=loc, ip=ip),
+            gmem_base.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            Int32(row_stride_bytes).ir_value(loc=loc, ip=ip),
+        ],
+        """{
+        .reg .u32 t, row0, row, col, linear_bytes, swz, smem_off, s0;
+        .reg .u64 g0, row_bytes, col_bytes;
+        mov.u32 t, $1;
+        shr.u32 row0, t, 3;
+        and.b32 col, t, 7;
+        shl.b32 col, col, 3;
+
+        mov.u32 row, row0;
+        mul.wide.u32 row_bytes, row, $4;
+        mul.wide.u32 col_bytes, col, 2;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes;
+        shl.b32 linear_bytes, row, 7;
+        shl.b32 smem_off, col, 1;
+        add.u32 linear_bytes, linear_bytes, smem_off;
+        and.b32 swz, linear_bytes, 896;
+        shr.u32 swz, swz, 3;
+        xor.b32 smem_off, linear_bytes, swz;
+        add.u32 s0, $2, smem_off;
+        cp.async.cg.shared.global.L2::128B [s0], [g0], 16;
+
+        add.u32 row, row0, 16;
+        mul.wide.u32 row_bytes, row, $4;
+        mul.wide.u32 col_bytes, col, 2;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes;
+        shl.b32 linear_bytes, row, 7;
+        shl.b32 smem_off, col, 1;
+        add.u32 linear_bytes, linear_bytes, smem_off;
+        and.b32 swz, linear_bytes, 896;
+        shr.u32 swz, swz, 3;
+        xor.b32 smem_off, linear_bytes, swz;
+        add.u32 s0, $2, smem_off;
+        cp.async.cg.shared.global.L2::128B [s0], [g0], 16;
+
+        add.u32 row, row0, 32;
+        mul.wide.u32 row_bytes, row, $4;
+        mul.wide.u32 col_bytes, col, 2;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes;
+        shl.b32 linear_bytes, row, 7;
+        shl.b32 smem_off, col, 1;
+        add.u32 linear_bytes, linear_bytes, smem_off;
+        and.b32 swz, linear_bytes, 896;
+        shr.u32 swz, swz, 3;
+        xor.b32 smem_off, linear_bytes, swz;
+        add.u32 s0, $2, smem_off;
+        cp.async.cg.shared.global.L2::128B [s0], [g0], 16;
+
+        add.u32 row, row0, 48;
         mul.wide.u32 row_bytes, row, $4;
         mul.wide.u32 col_bytes, col, 2;
         add.u64 g0, $3, row_bytes;
@@ -1116,27 +1207,31 @@ class ChunkDeltaBwdDhuSm90:
             gW1 = cute.make_tensor(w_ptr + base_k_aligned + BK, cute.make_layout((BK, BT), stride=(1, H * K)))
             gDo = cute.make_tensor(do_ptr + base_v_aligned, cute.make_layout((self.BV, BT), stride=(1, H * V)))
 
-            cute.copy(copy_k, copy_k_thr.partition_S(gK0), copy_k_thr.partition_D(sK0)[None, None, None, 0])
-            cute.copy(copy_k, copy_k_thr.partition_S(gK1), copy_k_thr.partition_D(sK1)[None, None, None, 0])
-            cute.copy(copy_mn, copy_mn_thr.partition_S(gW0), copy_mn_thr.partition_D(sW0)[None, None, None, 0])
-            cute.copy(copy_mn, copy_mn_thr.partition_S(gQ0), copy_mn_thr.partition_D(sQ0)[None, None, None, 0])
-            cute.copy(copy_mn, copy_mn_thr.partition_S(gW1), copy_mn_thr.partition_D(sW1)[None, None, None, 0])
-            cute.copy(copy_mn, copy_mn_thr.partition_S(gQ1), copy_mn_thr.partition_D(sQ1)[None, None, None, 0])
             if cutlass.const_expr(self.BV == 64):
-                _cp_async_do_mn_sw128_64x64(
-                    tidx,
-                    sDoRaw.iterator.toint(),
-                    do_ptr + base_v,
-                    H * V * 2,
-                )
+                k_row_stride_bytes = H * K * 2
+                v_row_stride_bytes = H * V * 2
+                _cp_async_k_sw128_64x64(tidx, sK0Raw.iterator.toint(), k_ptr + base_k, k_row_stride_bytes)
+                _cp_async_k_sw128_64x64(tidx, sK1Raw.iterator.toint(), k_ptr + base_k + BK, k_row_stride_bytes)
+                _cp_async_mn_sw128_64x64(tidx, sW0Raw.iterator.toint(), w_ptr + base_k, k_row_stride_bytes)
+                _cp_async_mn_sw128_64x64(tidx, sQ0Raw.iterator.toint(), q_ptr + base_k, k_row_stride_bytes)
+                cute.arch.cp_async_commit_group()
+                _cp_async_mn_sw128_64x64(tidx, sW1Raw.iterator.toint(), w_ptr + base_k + BK, k_row_stride_bytes)
+                _cp_async_mn_sw128_64x64(tidx, sQ1Raw.iterator.toint(), q_ptr + base_k + BK, k_row_stride_bytes)
+                _cp_async_mn_sw128_64x64(tidx, sDoRaw.iterator.toint(), do_ptr + base_v, v_row_stride_bytes)
                 self._cp_async_dv_bridge_64x64(
                     tidx,
                     sDvPrefRaw.iterator,
                     dv_ptr + base_v,
-                    H * V * 2,
+                    v_row_stride_bytes,
                 )
                 cute.arch.cp_async_commit_group()
             else:
+                cute.copy(copy_k, copy_k_thr.partition_S(gK0), copy_k_thr.partition_D(sK0)[None, None, None, 0])
+                cute.copy(copy_k, copy_k_thr.partition_S(gK1), copy_k_thr.partition_D(sK1)[None, None, None, 0])
+                cute.copy(copy_mn, copy_mn_thr.partition_S(gW0), copy_mn_thr.partition_D(sW0)[None, None, None, 0])
+                cute.copy(copy_mn, copy_mn_thr.partition_S(gQ0), copy_mn_thr.partition_D(sQ0)[None, None, None, 0])
+                cute.copy(copy_mn, copy_mn_thr.partition_S(gW1), copy_mn_thr.partition_D(sW1)[None, None, None, 0])
+                cute.copy(copy_mn, copy_mn_thr.partition_S(gQ1), copy_mn_thr.partition_D(sQ1)[None, None, None, 0])
                 self._copy_do_tile(gDo, sDo, tidx)
             cute.arch.sync_threads()
 
