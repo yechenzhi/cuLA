@@ -51,6 +51,22 @@ def _pack_bf16x2_f32(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Int32:
 
 
 @cutlass.dsl_user_op
+def _warpgroup_fence_operand_f32(x: Float32, *, loc=None, ip=None) -> Float32:
+    result = _llvm.inline_asm(
+        _T.f32(),
+        [Float32(x).ir_value(loc=loc, ip=ip)],
+        "",
+        "=f,0",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Float32(result)
+
+
+@cutlass.dsl_user_op
 def _store_bridge_64x32_bf16(
     tidx: Int32,
     smem_base: Int32,
@@ -947,6 +963,12 @@ class ChunkDeltaBwdDhuSm90:
         out.store(acc.load().to(dtype))
         return out
 
+    @staticmethod
+    @cute.jit
+    def _fence_acc(acc: cute.Tensor):
+        for i in cutlass.range_constexpr(cute.size(acc)):
+            acc[i] = _warpgroup_fence_operand_f32(acc[i])
+
     @cute.jit
     def _copy_do_tile(self, gDo: cute.Tensor, sDo: cute.Tensor, tidx: Int32):
         vecs_per_row = self.BV // 8
@@ -1609,6 +1631,7 @@ class ChunkDeltaBwdDhuSm90:
             acc_dv2 = kdh_thr.make_fragment_C(kdh_c_shape)
             acc_dv2.fill(0.0)
 
+            self._fence_acc(acc_dv2)
             cute.nvgpu.warpgroup.fence()
             self._gemm_sm90_loop(
                 kdh_mma,
@@ -1619,7 +1642,7 @@ class ChunkDeltaBwdDhuSm90:
             )
             cute.nvgpu.warpgroup.commit_group()
             cute.nvgpu.warpgroup.wait_group(0)
-            cute.nvgpu.warpgroup.fence()
+            self._fence_acc(acc_dv2)
 
             cute.nvgpu.warpgroup.fence()
             self._gemm_sm90_loop(
@@ -1631,7 +1654,7 @@ class ChunkDeltaBwdDhuSm90:
             )
             cute.nvgpu.warpgroup.commit_group()
             cute.nvgpu.warpgroup.wait_group(0)
-            cute.nvgpu.warpgroup.fence()
+            self._fence_acc(acc_dv2)
 
             if cutlass.const_expr(self.BV == 64):
                 self._add_dv_bridge_64x64_from_smem(
@@ -1699,6 +1722,8 @@ class ChunkDeltaBwdDhuSm90:
             acc_wdv0.fill(0.0)
             acc_wdv1.fill(0.0)
 
+            self._fence_acc(acc_qdo0)
+            self._fence_acc(acc_qdo1)
             cute.nvgpu.warpgroup.fence()
             self._gemm_sm90_loop(
                 update_mma,
@@ -1716,8 +1741,11 @@ class ChunkDeltaBwdDhuSm90:
             )
             cute.nvgpu.warpgroup.commit_group()
             cute.nvgpu.warpgroup.wait_group(0)
-            cute.nvgpu.warpgroup.fence()
+            self._fence_acc(acc_qdo0)
+            self._fence_acc(acc_qdo1)
 
+            self._fence_acc(acc_wdv0)
+            self._fence_acc(acc_wdv1)
             cute.nvgpu.warpgroup.fence()
             self._gemm_sm90_loop(
                 update_mma,
@@ -1735,7 +1763,8 @@ class ChunkDeltaBwdDhuSm90:
             )
             cute.nvgpu.warpgroup.commit_group()
             cute.nvgpu.warpgroup.wait_group(0)
-            cute.nvgpu.warpgroup.fence()
+            self._fence_acc(acc_wdv0)
+            self._fence_acc(acc_wdv1)
 
             for i in cutlass.range_constexpr(cute.size(state0)):
                 state0[i] += acc_qdo0[i] * scale - acc_wdv0[i]
