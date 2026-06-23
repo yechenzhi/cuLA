@@ -17,7 +17,7 @@
 
 Scope:
   - fixed-length only
-  - K in {64, 128}, V=64, chunk_size=64
+  - K in {64, 128}, V=64 or K=128/V=128, chunk_size=64
   - no g/gk
   - optional h0/dht enabled by default
 
@@ -38,7 +38,7 @@ from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu as fla_b
 
 from cula.ops.chunk_delta_h_bwd import chunk_gated_delta_rule_bwd_dhu as cula_bwd_dhu
 
-V, BT = 64, 64
+BT = 64
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
 WARMUP = 10
@@ -69,7 +69,7 @@ def accuracy_stats(ref: torch.Tensor, out: torch.Tensor) -> tuple[float, float]:
     return diff.max().item(), diff.mean().item()
 
 
-def make_inputs(B: int, T: int, H: int, K: int, use_h0: bool, use_dht: bool, seed: int):
+def make_inputs(B: int, T: int, H: int, K: int, V: int, use_h0: bool, use_dht: bool, seed: int):
     torch.manual_seed(seed)
     q = (torch.randn(B, T, H, K, device=DEVICE, dtype=DTYPE) * 0.1).contiguous()
     k = (torch.randn(B, T, H, K, device=DEVICE, dtype=DTYPE) * 0.1).contiguous()
@@ -83,7 +83,7 @@ def make_inputs(B: int, T: int, H: int, K: int, use_h0: bool, use_dht: bool, see
 
 def run_one(args, T: int):
     torch.cuda.empty_cache()
-    q, k, w, do, dv, h0, dht = make_inputs(args.B, T, args.H, args.K, args.h0, args.dht, args.seed)
+    q, k, w, do, dv, h0, dht = make_inputs(args.B, T, args.H, args.K, args.V, args.h0, args.dht, args.seed)
     common = dict(q=q, k=k, w=w, do=do, dv=dv, h0=h0, dht=dht, scale=args.scale, chunk_size=BT)
 
     ref_dh, ref_dh0, ref_dv2 = fla_bwd_dhu(**common)
@@ -128,6 +128,7 @@ def main():
     parser.add_argument("--B", type=int, default=1)
     parser.add_argument("--H", type=int, default=8)
     parser.add_argument("--K", type=int, choices=(64, 128), default=64)
+    parser.add_argument("--V", type=int, choices=(64, 128), default=64)
     parser.add_argument("--T", type=int, nargs="+", default=[4096, 4096 * 4])
     parser.add_argument("--scale", type=float, default=0.125)
     parser.add_argument("--warmup", type=int, default=WARMUP)
@@ -142,6 +143,8 @@ def main():
     if args.ncu:
         args.warmup = 1
         args.iters = 1
+    if args.V == 128 and args.K != 128:
+        raise ValueError(f"V=128 is currently supported only for K=128, got K={args.K}")
 
     global NCU_MODE
     NCU_MODE = args.ncu
@@ -150,7 +153,7 @@ def main():
         raise RuntimeError("CUDA is required")
 
     print("chunk_gated_delta_rule_bwd_dhu64: C++ CUTLASS/CuTe path vs FLA Triton")
-    print(f"B={args.B} H={args.H} K={args.K} V={V} h0={args.h0} dht={args.dht} warmup={args.warmup} iters={args.iters}")
+    print(f"B={args.B} H={args.H} K={args.K} V={args.V} h0={args.h0} dht={args.dht} warmup={args.warmup} iters={args.iters}")
     print(
         f"{'T':>8} {'flags':<10} {'dh max':>10} {'dh mean':>10} {'dv2 max':>10} {'dv2 mean':>10} "
         f"{'dh0 max':>10} {'FLA ms':>10} {'C++ ms':>10} {'speedup':>8}"

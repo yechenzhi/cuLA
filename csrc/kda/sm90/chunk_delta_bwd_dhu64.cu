@@ -469,13 +469,13 @@ r2s_acc_store_64x64_postbar(
 
 template <typename STile>
 CUTE_DEVICE void
-cp_async_do_tile(int tid, Element const* __restrict__ do_base, STile const& sDo, int H) {
+cp_async_do_tile(int tid, Element const* __restrict__ do_base, STile const& sDo, int H, int VDim) {
     CUTE_UNROLL
     for (int iter = 0; iter < 2; ++iter) {
         int vec_idx = tid + iter * kThreads;
         int t_rel = vec_idx >> 2;
         int v_rel = (vec_idx & 3) * 8;
-        auto const* src = reinterpret_cast<uint128_t const*>(do_base + int64_t(t_rel) * H * kV + v_rel);
+        auto const* src = reinterpret_cast<uint128_t const*>(do_base + int64_t(t_rel) * H * VDim + v_rel);
         auto* dst = reinterpret_cast<uint128_t*>(&sDo(v_rel, t_rel, _0{}));
         SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>::copy(*src, *dst);
     }
@@ -483,25 +483,25 @@ cp_async_do_tile(int tid, Element const* __restrict__ do_base, STile const& sDo,
 
 template <typename STile>
 CUTE_DEVICE void
-cp_async_do_tile64(int tid, Element const* __restrict__ do_base, STile const& sDo, int H) {
+cp_async_do_tile64(int tid, Element const* __restrict__ do_base, STile const& sDo, int H, int VDim) {
     CUTE_UNROLL
     for (int iter = 0; iter < 4; ++iter) {
         int vec_idx = tid + iter * kThreads;
         int t_rel = vec_idx >> 3;
         int v_rel = (vec_idx & 7) * 8;
-        auto const* src = reinterpret_cast<uint128_t const*>(do_base + int64_t(t_rel) * H * kV + v_rel);
+        auto const* src = reinterpret_cast<uint128_t const*>(do_base + int64_t(t_rel) * H * VDim + v_rel);
         auto* dst = reinterpret_cast<uint128_t*>(&sDo(v_rel, t_rel, _0{}));
         SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>::copy(*src, *dst);
     }
 }
 
 CUTE_DEVICE void
-cp_async_dv_bridge_tile(int tid, Element const* __restrict__ dv_base, Element* smem_stage, int H) {
+cp_async_dv_bridge_tile(int tid, Element const* __restrict__ dv_base, Element* smem_stage, int H, int VDim) {
     int row = (tid >> 2) & 31;
     int col = (tid & 3) * 8;
     int store_offset = (((tid & 24) << 7) | ((tid & 3) << 5)) ^ ((tid & 124) << 2);
-    auto const* src0 = reinterpret_cast<uint128_t const*>(dv_base + int64_t(row) * H * kV + col);
-    auto const* src1 = reinterpret_cast<uint128_t const*>(dv_base + int64_t(row + 32) * H * kV + col);
+    auto const* src0 = reinterpret_cast<uint128_t const*>(dv_base + int64_t(row) * H * VDim + col);
+    auto const* src1 = reinterpret_cast<uint128_t const*>(dv_base + int64_t(row + 32) * H * VDim + col);
     char* smem_bytes = reinterpret_cast<char*>(smem_stage);
     auto* dst0 = reinterpret_cast<uint128_t*>(smem_bytes + store_offset);
     auto* dst1 = reinterpret_cast<uint128_t*>(smem_bytes + store_offset + 512);
@@ -510,9 +510,9 @@ cp_async_dv_bridge_tile(int tid, Element const* __restrict__ dv_base, Element* s
 }
 
 CUTE_DEVICE void
-cp_async_dv_bridge_tile64(int tid, Element const* __restrict__ dv_base, Element* smem_stage, int H) {
-    cp_async_dv_bridge_tile(tid, dv_base, smem_stage, H);
-    cp_async_dv_bridge_tile(tid, dv_base + kBV, smem_stage + kBT * kBV, H);
+cp_async_dv_bridge_tile64(int tid, Element const* __restrict__ dv_base, Element* smem_stage, int H, int VDim) {
+    cp_async_dv_bridge_tile(tid, dv_base, smem_stage, H, VDim);
+    cp_async_dv_bridge_tile(tid, dv_base + kBV, smem_stage + kBT * kBV, H, VDim);
 }
 
 template <typename AccFrag>
@@ -822,8 +822,9 @@ load_acc_64x64_bf16_from_smem(int tid, Element* smem_load, AccFrag& acc) {
     load_acc_64x32_bf16_from_smem_offset<16>(tid, smem_load + kBT * kBV, acc);
 }
 
+template <int VDim>
 __global__
-__launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_v64(
+__launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_vtile64(
     Element const* __restrict__ q,
     Element const* __restrict__ k,
     Element const* __restrict__ w,
@@ -840,14 +841,17 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_v
     float scale,
     bool has_dht,
     bool store_dh0) {
+    static_assert(VDim == kV || VDim == 128);
     (void)B;
     (void)HArg;
     constexpr int H = 64;
     constexpr int KDim = 128;
     int tid = int(threadIdx.x);
+    int v_tile = int(blockIdx.x);
     int bh = int(blockIdx.y);
     int b = bh >> 6;
     int h = bh & 63;
+    int v_base = v_tile * kV;
 
     auto shape_mnk = make_shape(Int<64>{}, Int<64>{}, Int<64>{});
     auto cta_tiler = make_shape(Int<64>{}, Int<64>{}, Int<64>{});
@@ -917,9 +921,9 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_v
             auto coord = tCUpdate(i);
             int k_rel = int(get<0>(coord));
             int v_rel = int(get<1>(coord));
-            int64_t off = ((int64_t(b) * H + h) * KDim + k_rel) * kV + v_rel;
+            int64_t off = ((int64_t(b) * H + h) * KDim + k_rel) * VDim + v_base + v_rel;
             state(i) = dht[off];
-            state1(i) = dht[off + int64_t(kK) * kV];
+            state1(i) = dht[off + int64_t(kK) * VDim];
         }
     } else {
         clear(state);
@@ -929,7 +933,7 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_v
     auto prefetch_chunk = [&](int chunk, int stage) {
         int t0 = chunk * kBT;
         int64_t base_t = (int64_t(b) * T + t0) * H * KDim + int64_t(h) * KDim;
-        int64_t base_v = (int64_t(b) * T + t0) * H * kV + int64_t(h) * kV;
+        int64_t base_v = ((int64_t(b) * T + t0) * H + h) * VDim + v_base;
 
         Tensor sDoStage = make_tensor(make_smem_ptr(smem_do + stage * kFullTile), SmemLayoutMN64{});
         Tensor sKStage = make_tensor(make_smem_ptr(smem_k + stage * kKBlocks<KDim> * kFullTile), SmemLayoutK64{});
@@ -989,9 +993,9 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_v
             copy_mn_thr.partition_S(gQ1),
             copy_mn_thr.partition_D(as_position_independent_swizzle_tensor(sQStage1)));
 
-        cp_async_do_tile64(tid, do_ + base_v, sDoStage, H);
+        cp_async_do_tile64(tid, do_ + base_v, sDoStage, H, VDim);
         int dv_stage = (NT - 1 - chunk) & 1;
-        cp_async_dv_bridge_tile64(tid, dv + base_v, smem_dv_pref + dv_stage * kFullTile, H);
+        cp_async_dv_bridge_tile64(tid, dv + base_v, smem_dv_pref + dv_stage * kFullTile, H, VDim);
         cp_async_fence();
     };
 
@@ -1006,8 +1010,8 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_v
         int chunk = NT - 1 - iter;
         int stage = iter & 1;
         int t0 = chunk * kBT;
-        int64_t base_v = (int64_t(b) * T + t0) * H * kV + int64_t(h) * kV;
-        int64_t dh_base = (((int64_t(b) * NT + chunk) * H + h) * KDim) * kV;
+        int64_t base_v = ((int64_t(b) * T + t0) * H + h) * VDim + v_base;
+        int64_t dh_base = (((int64_t(b) * NT + chunk) * H + h) * KDim) * VDim + v_base;
 
         Tensor sDoStage = make_tensor(make_smem_ptr(smem_do + stage * kFullTile), SmemLayoutMN64{});
         Tensor sKStage = make_tensor(make_smem_ptr(smem_k + stage * kKBlocks<KDim> * kFullTile), SmemLayoutK64{});
@@ -1029,7 +1033,7 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_v
             tid,
             smem_bridge,
             dh + dh_base,
-            uint32_t(kV * sizeof(Element)));
+            uint32_t(VDim * sizeof(Element)));
         r2s_acc_store_64x64(
             update_mma,
             r2s_update,
@@ -1038,8 +1042,8 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_v
             sDhStore1,
             tid,
             smem_bridge,
-            dh + dh_base + int64_t(kK) * kV,
-            uint32_t(kV * sizeof(Element)));
+            dh + dh_base + int64_t(kK) * VDim,
+            uint32_t(VDim * sizeof(Element)));
 
         if (pending_groups >= 4) {
             cp_async_wait<2>();
@@ -1092,7 +1096,7 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_v
             tid,
             smem_bridge,
             dv2 + base_v,
-            uint32_t(H * kV * sizeof(Element)));
+            uint32_t(H * VDim * sizeof(Element)));
 
         Tensor tQ = update_thr.partition_A(sQStage);
         Tensor tQR = update_thr.make_fragment_A(tQ);
@@ -1155,14 +1159,14 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_v
             auto coord = tCUpdate(i);
             int k_rel = int(get<0>(coord));
             int v_rel = int(get<1>(coord));
-            int64_t off = ((int64_t(b) * H + h) * KDim + k_rel) * kV + v_rel;
+            int64_t off = ((int64_t(b) * H + h) * KDim + k_rel) * VDim + v_base + v_rel;
             dh0[off] = state(i);
-            dh0[off + int64_t(kK) * kV] = state1(i);
+            dh0[off + int64_t(kK) * VDim] = state1(i);
         }
     }
 }
 
-template <int KDim, int HStatic = 0, int VTile = kBV>
+template <int KDim, int HStatic = 0, int VTile = kBV, int VDimStatic = 0>
 __global__
 __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
     Element const* __restrict__ q,
@@ -1178,13 +1182,17 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
     int T,
     int HArg,
     int NT,
+    int VDimArg,
     float scale,
     bool has_dht,
     bool store_dh0) {
     static_assert(VTile == kBV || VTile == kV);
     static_assert(kV % VTile == 0);
+    static_assert(VDimStatic == 0 || VDimStatic == kV || VDimStatic == 128);
+    static_assert(VDimStatic == 0 || VDimStatic % VTile == 0);
     (void)B;
     int const H = HStatic == 0 ? HArg : HStatic;
+    int const VDim = VDimStatic == 0 ? VDimArg : VDimStatic;
     int tid = int(threadIdx.x);
     int v_tile = int(blockIdx.x);
     int bh = int(blockIdx.y);
@@ -1275,15 +1283,15 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
             auto coord = tCUpdate(i);
             int k_rel = int(get<0>(coord));
             int v_rel = int(get<1>(coord));
-            int64_t off = ((int64_t(b) * H + h) * KDim + k_rel) * kV + v_base + v_rel;
+            int64_t off = ((int64_t(b) * H + h) * KDim + k_rel) * VDim + v_base + v_rel;
             state(i) = dht[off];
             if constexpr (VTile > kBV) {
                 state_v1(i) = dht[off + kBV];
             }
             if constexpr (KDim > kK) {
-                state1(i) = dht[off + int64_t(kK) * kV];
+                state1(i) = dht[off + int64_t(kK) * VDim];
                 if constexpr (VTile > kBV) {
-                    state1_v1(i) = dht[off + int64_t(kK) * kV + kBV];
+                    state1_v1(i) = dht[off + int64_t(kK) * VDim + kBV];
                 }
             }
         }
@@ -1303,7 +1311,7 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
     auto prefetch_chunk = [&](int chunk, int stage) {
         int t0 = chunk * kBT;
         int64_t base_t = (int64_t(b) * T + t0) * H * KDim + int64_t(h) * KDim;
-        int64_t base_v = (int64_t(b) * T + t0) * H * kV + int64_t(h) * kV + v_base;
+        int64_t base_v = ((int64_t(b) * T + t0) * H + h) * VDim + v_base;
 
         Tensor sDoStage = make_tensor(
             make_smem_ptr(smem_do + stage * kVBlocks<VTile> * cosize_v<SmemLayoutMN32Read>), SmemLayoutMN32Read{});
@@ -1371,23 +1379,24 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
                 copy_mn_thr.partition_D(as_position_independent_swizzle_tensor(sQStage1)));
         }
 
-        cp_async_do_tile(tid, do_ + base_v, sDoStage, H);
+        cp_async_do_tile(tid, do_ + base_v, sDoStage, H, VDim);
         if constexpr (VTile > kBV) {
             Tensor sDoStageV1 = make_tensor(
                 make_smem_ptr(smem_do + (stage * kVBlocks<VTile> + 1) * cosize_v<SmemLayoutMN32Read>),
                 SmemLayoutMN32Read{});
-            cp_async_do_tile(tid, do_ + base_v + kBV, sDoStageV1, H);
+            cp_async_do_tile(tid, do_ + base_v + kBV, sDoStageV1, H, VDim);
         }
         if constexpr (KDim > kK) {
             int dv_stage = (NT - 1 - chunk) & 1;
             cp_async_dv_bridge_tile(
-                tid, dv + base_v, smem_dv_pref + dv_stage * kVBlocks<VTile> * cosize_v<SmemLayoutMN32Read>, H);
+                tid, dv + base_v, smem_dv_pref + dv_stage * kVBlocks<VTile> * cosize_v<SmemLayoutMN32Read>, H, VDim);
             if constexpr (VTile > kBV) {
                 cp_async_dv_bridge_tile(
                     tid,
                     dv + base_v + kBV,
                     smem_dv_pref + (dv_stage * kVBlocks<VTile> + 1) * cosize_v<SmemLayoutMN32Read>,
-                    H);
+                    H,
+                    VDim);
             }
         }
         cp_async_fence();
@@ -1412,7 +1421,7 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
         int chunk = NT - 1 - iter;
         int stage = iter % kStages;
         int t0 = chunk * kBT;
-        int64_t base_v = (int64_t(b) * T + t0) * H * kV + int64_t(h) * kV + v_base;
+        int64_t base_v = ((int64_t(b) * T + t0) * H + h) * VDim + v_base;
 
         Tensor sDoStage = make_tensor(
             make_smem_ptr(smem_do + stage * kVBlocks<VTile> * cosize_v<SmemLayoutMN32Read>), SmemLayoutMN32Read{});
@@ -1432,7 +1441,7 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
         Tensor sQStage1 = make_tensor(
             make_smem_ptr(smem_q + (stage * kKBlocks<KDim> + 1) * cosize_v<SmemLayoutMN64>), SmemLayoutMN64{});
 
-        int64_t dh_base = (((int64_t(b) * NT + chunk) * H + h) * KDim) * kV + v_base;
+        int64_t dh_base = (((int64_t(b) * NT + chunk) * H + h) * KDim) * VDim + v_base;
         // FLA/Triton stores dh before applying this chunk's update.  The
         // global-store layout is separate from the WGMMA-B shared tile.
         r2s_acc_store(
@@ -1444,7 +1453,7 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
             tid,
             smem_dh_bridge,
             dh + dh_base,
-            uint32_t(kV * sizeof(Element)));
+            uint32_t(VDim * sizeof(Element)));
         if constexpr (KDim > kK) {
             r2s_acc_store(
                 update_mma,
@@ -1454,8 +1463,8 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
                 sDhStore1,
                 tid,
                 smem_dh_bridge,
-                dh + dh_base + int64_t(kK) * kV,
-                uint32_t(kV * sizeof(Element)));
+                dh + dh_base + int64_t(kK) * VDim,
+                uint32_t(VDim * sizeof(Element)));
         }
         if constexpr (VTile > kBV) {
             r2s_acc_store(
@@ -1467,7 +1476,7 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
                 tid,
                 smem_dh_bridge,
                 dh + dh_base + kBV,
-                uint32_t(kV * sizeof(Element)));
+                uint32_t(VDim * sizeof(Element)));
             if constexpr (KDim > kK) {
                 r2s_acc_store(
                     update_mma,
@@ -1477,8 +1486,8 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
                     sDhStore1V1,
                     tid,
                     smem_dh_bridge,
-                    dh + dh_base + int64_t(kK) * kV + kBV,
-                    uint32_t(kV * sizeof(Element)));
+                    dh + dh_base + int64_t(kK) * VDim + kBV,
+                    uint32_t(VDim * sizeof(Element)));
             }
         }
 
@@ -1540,7 +1549,7 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
                     acc_dv(i) += acc_dv_in(i);
                 }
             } else {
-                load_acc_64x32_bf16(tid, smem_dh_bridge, dv + base_v, uint32_t(H * kV * sizeof(Element)), acc_dv);
+                load_acc_64x32_bf16(tid, smem_dh_bridge, dv + base_v, uint32_t(H * VDim * sizeof(Element)), acc_dv);
 
                 warpgroup_fence_operand(acc_dv);
                 warpgroup_arrive();
@@ -1559,7 +1568,7 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
                 tid,
                 smem_dv2_bridge,
                 dv2 + base_v,
-                uint32_t(H * kV * sizeof(Element)));
+                uint32_t(H * VDim * sizeof(Element)));
 
             Tensor tQ = update_thr.partition_A(sQStage);
             Tensor tQR = update_thr.make_fragment_A(tQ);
@@ -1678,7 +1687,7 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
                     }
                 } else {
                     load_acc_64x32_bf16(
-                        tid, smem_dh_bridge, dv + base_v + v_offset, uint32_t(H * kV * sizeof(Element)), acc_dv);
+                        tid, smem_dh_bridge, dv + base_v + v_offset, uint32_t(H * VDim * sizeof(Element)), acc_dv);
 
                     warpgroup_fence_operand(acc_dv);
                     warpgroup_arrive();
@@ -1697,7 +1706,7 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
                     tid,
                     smem_dv2_bridge,
                     dv2 + base_v + v_offset,
-                    uint32_t(H * kV * sizeof(Element)));
+                    uint32_t(H * VDim * sizeof(Element)));
 
                 Tensor tQ = update_thr.partition_A(sQStage);
                 Tensor tQR = update_thr.make_fragment_A(tQ);
@@ -1824,15 +1833,15 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
             auto coord = tCUpdate(i);
             int k_rel = int(get<0>(coord));
             int v_rel = int(get<1>(coord));
-            int64_t off = ((int64_t(b) * H + h) * KDim + k_rel) * kV + v_base + v_rel;
+            int64_t off = ((int64_t(b) * H + h) * KDim + k_rel) * VDim + v_base + v_rel;
             dh0[off] = state(i);
             if constexpr (VTile > kBV) {
                 dh0[off + kBV] = state_v1(i);
             }
             if constexpr (KDim > kK) {
-                dh0[off + int64_t(kK) * kV] = state1(i);
+                dh0[off + int64_t(kK) * VDim] = state1(i);
                 if constexpr (VTile > kBV) {
-                    dh0[off + int64_t(kK) * kV + kBV] = state1_v1(i);
+                    dh0[off + int64_t(kK) * VDim + kBV] = state1_v1(i);
                 }
             }
         }
@@ -1881,53 +1890,89 @@ ChunkGatedDeltaRuleBwdDhu64(
     int64_t T = q.size(1);
     int64_t H = q.size(2);
     int64_t K = q.size(3);
+    TORCH_CHECK(dO.dim() == 4, "do must be rank-4 [B, T, H, V]");
+    int64_t V = dO.size(3);
     TORCH_CHECK(K == 64 || K == 128, "only K=64 or K=128 is supported, got K=", K);
-    TORCH_CHECK(dO.dim() == 4 && dO.size(3) == kV, "only V=64 is supported");
+    TORCH_CHECK(
+        V == 64 || (K == 128 && V == 128), "only V=64, or K=128 with V=128, is supported, got K=", K, ", V=", V);
     TORCH_CHECK(T % kBT == 0, "T must be a multiple of 64, got T=", T);
 
     check_bf16_4d("q", q, B, T, H, K);
     check_bf16_4d("k", k, B, T, H, K);
     check_bf16_4d("w", w, B, T, H, K);
-    check_bf16_4d("do", dO, B, T, H, kV);
-    check_bf16_4d("dv", dV, B, T, H, kV);
+    check_bf16_4d("do", dO, B, T, H, V);
+    check_bf16_4d("dv", dV, B, T, H, V);
 
     if (h0.has_value()) {
         TORCH_CHECK(h0->is_cuda(), "h0 must be CUDA when provided");
         TORCH_CHECK(h0->scalar_type() == at::kFloat, "h0 must be float32 when provided");
         TORCH_CHECK(h0->is_contiguous(), "h0 must be contiguous when provided");
-        TORCH_CHECK(h0->sizes() == at::IntArrayRef({B, H, K, kV}), "h0 shape must be [B, H, K, 64], got ", h0->sizes());
+        TORCH_CHECK(h0->sizes() == at::IntArrayRef({B, H, K, V}), "h0 shape must be [B, H, K, V], got ", h0->sizes());
     }
     if (dht.has_value()) {
         TORCH_CHECK(dht->is_cuda(), "dht must be CUDA when provided");
         TORCH_CHECK(dht->scalar_type() == at::kFloat, "dht must be float32 when provided");
         TORCH_CHECK(dht->is_contiguous(), "dht must be contiguous when provided");
         TORCH_CHECK(
-            dht->sizes() == at::IntArrayRef({B, H, K, kV}), "dht shape must be [B, H, K, 64], got ", dht->sizes());
+            dht->sizes() == at::IntArrayRef({B, H, K, V}), "dht shape must be [B, H, K, V], got ", dht->sizes());
     }
 
     int64_t NT = T / kBT;
-    auto dh = torch::empty({B, NT, H, K, kV}, q.options());
+    auto dh = torch::empty({B, NT, H, K, V}, q.options());
     auto dv2 = torch::empty_like(dV);
     std::optional<torch::Tensor> dh0 = std::nullopt;
     if (h0.has_value()) {
-        dh0 = torch::empty({B, H, K, kV}, h0->options().dtype(at::kFloat));
+        dh0 = torch::empty({B, H, K, V}, h0->options().dtype(at::kFloat));
     }
 
     auto stream = at::cuda::getCurrentCUDAStream();
-    auto launch = [&]<int KDim, int HStatic, int VTile = kBV>() {
+    auto launch = [&]<int KDim, int HStatic, int VTile = kBV, int VDimStatic = 0>() {
         static std::once_flag attr_once;
         std::call_once(attr_once, [] {
             C10_CUDA_CHECK(cudaFuncSetAttribute(
-                chunk_delta_bwd_dhu64_sm90_kernel<KDim, HStatic, VTile>,
+                chunk_delta_bwd_dhu64_sm90_kernel<KDim, HStatic, VTile, VDimStatic>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 kSmemBytes<KDim, VTile>));
             C10_CUDA_CHECK(cudaFuncSetAttribute(
-                chunk_delta_bwd_dhu64_sm90_kernel<KDim, HStatic, VTile>,
+                chunk_delta_bwd_dhu64_sm90_kernel<KDim, HStatic, VTile, VDimStatic>,
                 cudaFuncAttributePreferredSharedMemoryCarveout,
                 cudaSharedmemCarveoutMaxShared));
         });
-        chunk_delta_bwd_dhu64_sm90_kernel<KDim, HStatic, VTile>
-            <<<dim3(kV / VTile, B * H), dim3(kThreads), kSmemBytes<KDim, VTile>, stream>>>(
+        chunk_delta_bwd_dhu64_sm90_kernel<KDim, HStatic, VTile, VDimStatic>
+            <<<dim3(V / VTile, B * H), dim3(kThreads), kSmemBytes<KDim, VTile>, stream>>>(
+                reinterpret_cast<Element const*>(q.data_ptr<at::BFloat16>()),
+                reinterpret_cast<Element const*>(k.data_ptr<at::BFloat16>()),
+                reinterpret_cast<Element const*>(w.data_ptr<at::BFloat16>()),
+                reinterpret_cast<Element const*>(dO.data_ptr<at::BFloat16>()),
+                reinterpret_cast<Element const*>(dV.data_ptr<at::BFloat16>()),
+                dht.has_value() ? dht->data_ptr<float>() : nullptr,
+                reinterpret_cast<Element*>(dh.data_ptr<at::BFloat16>()),
+                dh0.has_value() ? dh0->data_ptr<float>() : nullptr,
+                reinterpret_cast<Element*>(dv2.data_ptr<at::BFloat16>()),
+                static_cast<int>(B),
+                static_cast<int>(T),
+                static_cast<int>(H),
+                static_cast<int>(NT),
+                static_cast<int>(V),
+                static_cast<float>(scale),
+                dht.has_value(),
+                dh0.has_value());
+    };
+
+    auto launch_k128_h64_vtile64 = [&]<int VDim>() {
+        static std::once_flag attr_once;
+        std::call_once(attr_once, [] {
+            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_vtile64<VDim>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                kSmemBytesK128V64));
+            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_vtile64<VDim>,
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                cudaSharedmemCarveoutMaxShared));
+        });
+        chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_vtile64<VDim>
+            <<<dim3(VDim / kV, B * H), dim3(kThreads), kSmemBytesK128V64, stream>>>(
                 reinterpret_cast<Element const*>(q.data_ptr<at::BFloat16>()),
                 reinterpret_cast<Element const*>(k.data_ptr<at::BFloat16>()),
                 reinterpret_cast<Element const*>(w.data_ptr<at::BFloat16>()),
@@ -1946,56 +1991,37 @@ ChunkGatedDeltaRuleBwdDhu64(
                 dh0.has_value());
     };
 
-    auto launch_k128_h64_v64 = [&]() {
-        static std::once_flag attr_once;
-        std::call_once(attr_once, [] {
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_v64,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                kSmemBytesK128V64));
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_v64,
-                cudaFuncAttributePreferredSharedMemoryCarveout,
-                cudaSharedmemCarveoutMaxShared));
-        });
-        chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_v64<<<dim3(1, B * H), dim3(kThreads), kSmemBytesK128V64, stream>>>(
-            reinterpret_cast<Element const*>(q.data_ptr<at::BFloat16>()),
-            reinterpret_cast<Element const*>(k.data_ptr<at::BFloat16>()),
-            reinterpret_cast<Element const*>(w.data_ptr<at::BFloat16>()),
-            reinterpret_cast<Element const*>(dO.data_ptr<at::BFloat16>()),
-            reinterpret_cast<Element const*>(dV.data_ptr<at::BFloat16>()),
-            dht.has_value() ? dht->data_ptr<float>() : nullptr,
-            reinterpret_cast<Element*>(dh.data_ptr<at::BFloat16>()),
-            dh0.has_value() ? dh0->data_ptr<float>() : nullptr,
-            reinterpret_cast<Element*>(dv2.data_ptr<at::BFloat16>()),
-            static_cast<int>(B),
-            static_cast<int>(T),
-            static_cast<int>(H),
-            static_cast<int>(NT),
-            static_cast<float>(scale),
-            dht.has_value(),
-            dh0.has_value());
-    };
-
     if (K == 64) {
         if (H == 8) {
-            launch.template operator()<64, 8>();
+            launch.template operator()<64, 8, kBV, kV>();
         } else if (H == 64) {
-            launch.template operator()<64, 64>();
+            launch.template operator()<64, 64, kBV, kV>();
         } else if (H == 1) {
-            launch.template operator()<64, 1>();
+            launch.template operator()<64, 1, kBV, kV>();
         } else {
-            launch.template operator()<64, 0>();
+            launch.template operator()<64, 0, kBV, kV>();
         }
     } else {
-        if (H == 8) {
-            launch.template operator()<128, 8>();
-        } else if (H == 64) {
-            launch_k128_h64_v64();
+        if (H == 64) {
+            if (V == kV) {
+                launch_k128_h64_vtile64.template operator()<kV>();
+            } else {
+                launch_k128_h64_vtile64.template operator()<128>();
+            }
+        } else if (V == 128) {
+            if (H == 8) {
+                launch.template operator()<128, 8, kV, 128>();
+            } else if (H == 1) {
+                launch.template operator()<128, 1, kV, 128>();
+            } else {
+                launch.template operator()<128, 0, kV, 128>();
+            }
+        } else if (H == 8) {
+            launch.template operator()<128, 8, kBV, kV>();
         } else if (H == 1) {
-            launch.template operator()<128, 1>();
+            launch.template operator()<128, 1, kBV, kV>();
         } else {
-            launch.template operator()<128, 0>();
+            launch.template operator()<128, 0, kBV, kV>();
         }
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();

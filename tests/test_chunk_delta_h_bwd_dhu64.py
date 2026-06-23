@@ -25,10 +25,9 @@ ATOL = 1e-2
 RTOL = 1e-2
 
 
-def _make_inputs(B: int, T: int, H: int, K: int = 64, *, use_h0: bool, use_dht: bool, seed: int = 42):
+def _make_inputs(B: int, T: int, H: int, K: int = 64, V: int = 64, *, use_h0: bool, use_dht: bool, seed: int = 42):
     torch.manual_seed(seed)
     device = "cuda"
-    V = 64
 
     q = (torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
     k = (torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
@@ -96,6 +95,20 @@ def test_bwd_dhu64_long_t_against_fla(K: int):
 
 def test_bwd_dhu64_h64_k128_against_fla():
     q, k, w, do, dv, h0, dht = _make_inputs(1, 128, 64, 128, use_h0=True, use_dht=True, seed=11)
+    scale = 0.125
+
+    ref_dh, ref_dh0, ref_dv2 = fla_bwd_dhu(q=q, k=k, w=w, do=do, dv=dv, h0=h0, dht=dht, scale=scale, chunk_size=64)
+    our_dh, our_dh0, our_dv2 = cula_bwd_dhu(q=q, k=k, w=w, do=do, dv=dv, h0=h0, dht=dht, scale=scale, chunk_size=64)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(our_dh.float(), ref_dh.float(), atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(our_dv2.float(), ref_dv2.float(), atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(our_dh0.float(), ref_dh0.float(), atol=ATOL, rtol=RTOL)
+
+
+@pytest.mark.parametrize("H", [1, 64])
+def test_bwd_dhu64_k128_v128_against_fla(H: int):
+    q, k, w, do, dv, h0, dht = _make_inputs(1, 128, H, 128, 128, use_h0=True, use_dht=True, seed=13)
     scale = 0.125
 
     ref_dh, ref_dh0, ref_dv2 = fla_bwd_dhu(q=q, k=k, w=w, do=do, dv=dv, h0=h0, dht=dht, scale=scale, chunk_size=64)

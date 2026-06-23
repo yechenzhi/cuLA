@@ -15,7 +15,7 @@
 """C++/CUTLASS-CuTe chunk_delta_h backward dH/dU helper.
 
 This module intentionally exposes the first production targets:
-K in {64, 128}, V=64, chunk_size=64, fixed-length layout, no g/gk, no transposed state.
+K in {64, 128}, V=64 or K=128/V=128, chunk_size=64, fixed-length layout, no g/gk, no transposed state.
 The return order matches FLA's ``chunk_gated_delta_rule_bwd_dhu``:
 ``(dh, dh0, dv2)``.
 """
@@ -66,8 +66,10 @@ def chunk_gated_delta_rule_bwd_dhu(
         raise ValueError(f"C++ bwd_dhu64 requires chunk_size=64, got {chunk_size}")
     if q.ndim != 4:
         raise ValueError(f"q must have shape [B, T, H, K], got {tuple(q.shape)}")
-    if q.shape[-1] not in (64, 128) or do.shape[-1] != 64:
-        raise ValueError(f"C++ bwd_dhu64 requires K in {{64, 128}} and V=64, got K={q.shape[-1]}, V={do.shape[-1]}")
+    K = q.shape[-1]
+    V = do.shape[-1]
+    if K not in (64, 128) or V not in (64, 128) or (V == 128 and K != 128):
+        raise ValueError(f"C++ bwd_dhu64 requires K in {{64, 128}} with V=64, or K=128/V=128, got K={K}, V={V}")
     if q.shape[1] % 64 != 0:
         raise ValueError(f"C++ bwd_dhu64 requires T to be a multiple of 64, got T={q.shape[1]}")
     if q.dtype is not torch.bfloat16:
@@ -78,8 +80,8 @@ def chunk_gated_delta_rule_bwd_dhu(
     _check_same_shape("k", k, q)
     _check_same_shape("w", w, q)
     B, T, H, K = q.shape
-    _check_btv_shape("do", do, B, T, H, 64)
-    _check_btv_shape("dv", dv, B, T, H, 64)
+    _check_btv_shape("do", do, B, T, H, V)
+    _check_btv_shape("dv", dv, B, T, H, V)
 
     for name, x in (("q", q), ("k", k), ("w", w), ("do", do), ("dv", dv)):
         if x.dtype is not torch.bfloat16:
@@ -89,7 +91,7 @@ def chunk_gated_delta_rule_bwd_dhu(
         if not x.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
 
-    expected_state_shape = (B, H, K, 64)
+    expected_state_shape = (B, H, K, V)
     if h0 is not None:
         if h0.shape != expected_state_shape:
             raise ValueError(f"h0 must have shape {expected_state_shape}, got {tuple(h0.shape)}")
