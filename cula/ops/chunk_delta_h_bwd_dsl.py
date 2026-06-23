@@ -1298,15 +1298,15 @@ class ChunkDeltaBwdDhuSm90:
         r2s_update = cute.make_tiled_copy_C(atom_r2s, update_mma)
 
         self.kernel(
-            q_in,
-            k_in,
-            w_in,
-            do_in,
-            dv_in,
-            dh_in,
-            dh0_in,
-            dv2_in,
-            dht_in,
+            q_in.iterator,
+            k_in.iterator,
+            w_in.iterator,
+            do_in.iterator,
+            dv_in.iterator,
+            dh_in.iterator,
+            dh0_in.iterator,
+            dv2_in.iterator,
+            dht_in.iterator,
             kdh_mma,
             update_mma,
             copy_k,
@@ -1332,15 +1332,15 @@ class ChunkDeltaBwdDhuSm90:
     @cute.kernel
     def kernel(
         self,
-        q_in: cute.Tensor,
-        k_in: cute.Tensor,
-        w_in: cute.Tensor,
-        do_in: cute.Tensor,
-        dv_in: cute.Tensor,
-        dh_in: cute.Tensor,
-        dh0_in: cute.Tensor,
-        dv2_in: cute.Tensor,
-        dht_in: cute.Tensor,
+        q_in: cute.Pointer,
+        k_in: cute.Pointer,
+        w_in: cute.Pointer,
+        do_in: cute.Pointer,
+        dv_in: cute.Pointer,
+        dh_in: cute.Pointer,
+        dh0_in: cute.Pointer,
+        dv2_in: cute.Pointer,
+        dht_in: cute.Pointer,
         kdh_mma: cute.TiledMma,
         update_mma: cute.TiledMma,
         copy_k: cute.TiledCopy,
@@ -1380,15 +1380,15 @@ class ChunkDeltaBwdDhuSm90:
             b = bh // H
             h = bh - b * H
         v_base = v_tile * self.BV
-        q_ptr = q_in.iterator
-        k_ptr = k_in.iterator
-        w_ptr = w_in.iterator
-        do_ptr = do_in.iterator
-        dv_ptr = dv_in.iterator
-        dh_ptr = dh_in.iterator
-        dh0_ptr = dh0_in.iterator
-        dv2_ptr = dv2_in.iterator
-        dht_ptr = dht_in.iterator
+        q_ptr = q_in
+        k_ptr = k_in
+        w_ptr = w_in
+        do_ptr = do_in
+        dv_ptr = dv_in
+        dh_ptr = dh_in
+        dh0_ptr = dh0_in
+        dv2_ptr = dv2_in
+        dht_ptr = dht_in
 
         smem = cutlass.utils.SmemAllocator()
         if cutlass.const_expr(self.BV == 32):
