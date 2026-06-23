@@ -467,6 +467,33 @@ r2s_acc_store_64x64_postbar(
     store_bf16frag_64x64_postbar(tid, smem_store, gmem, row_stride_bytes, bf16);
 }
 
+template <int Rows, int Cols, typename AccFrag, typename CTensor>
+CUTE_DEVICE void
+store_dh0_tile_float(int tid, float* smem_store, float* gmem, int row_stride, AccFrag const& acc, CTensor const& tC) {
+    static_assert(Cols % 4 == 0);
+    static_assert((Rows * Cols) % (4 * kThreads) == 0);
+    CUTE_UNROLL
+    for (int i = 0; i < size(acc); ++i) {
+        auto coord = tC(i);
+        int row = int(get<0>(coord));
+        int col = int(get<1>(coord));
+        smem_store[row * Cols + col] = acc(i);
+    }
+    __syncthreads();
+
+    constexpr int kVecIters = (Rows * Cols) / (4 * kThreads);
+    CUTE_UNROLL
+    for (int iter = 0; iter < kVecIters; ++iter) {
+        int vec = tid + iter * kThreads;
+        int elem = vec * 4;
+        int row = elem / Cols;
+        int col = elem - row * Cols;
+        float4 value = *reinterpret_cast<float4 const*>(smem_store + elem);
+        *reinterpret_cast<float4*>(gmem + int64_t(row) * row_stride + col) = value;
+    }
+    __syncthreads();
+}
+
 template <typename STile>
 CUTE_DEVICE void
 cp_async_do_tile(int tid, Element const* __restrict__ do_base, STile const& sDo, int H, int VDim) {
@@ -1173,15 +1200,10 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_vtile
     }
 
     if (store_dh0) {
-        CUTE_UNROLL
-        for (int i = 0; i < size(state); ++i) {
-            auto coord = tCUpdate(i);
-            int k_rel = int(get<0>(coord));
-            int v_rel = int(get<1>(coord));
-            int64_t off = ((int64_t(b) * H + h) * KDim + k_rel) * VDim + v_base + v_rel;
-            dh0[off] = state(i);
-            dh0[off + int64_t(kK) * VDim] = state1(i);
-        }
+        float* smem_dh0 = reinterpret_cast<float*>(smem_raw);
+        float* dh0_base = dh0 + ((int64_t(b) * H + h) * KDim) * VDim + v_base;
+        store_dh0_tile_float<kK, kV>(tid, smem_dh0, dh0_base, VDim, state, tCUpdate);
+        store_dh0_tile_float<kK, kV>(tid, smem_dh0, dh0_base + int64_t(kK) * VDim, VDim, state1, tCUpdate);
     }
 }
 
@@ -1847,21 +1869,17 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel(
     }
 
     if (store_dh0) {
-        CUTE_UNROLL
-        for (int i = 0; i < size(state); ++i) {
-            auto coord = tCUpdate(i);
-            int k_rel = int(get<0>(coord));
-            int v_rel = int(get<1>(coord));
-            int64_t off = ((int64_t(b) * H + h) * KDim + k_rel) * VDim + v_base + v_rel;
-            dh0[off] = state(i);
+        float* smem_dh0 = reinterpret_cast<float*>(smem_raw);
+        float* dh0_base = dh0 + ((int64_t(b) * H + h) * KDim) * VDim + v_base;
+        store_dh0_tile_float<kK, kBV>(tid, smem_dh0, dh0_base, VDim, state, tCUpdate);
+        if constexpr (VTile > kBV) {
+            store_dh0_tile_float<kK, kBV>(tid, smem_dh0, dh0_base + kBV, VDim, state_v1, tCUpdate);
+        }
+        if constexpr (KDim > kK) {
+            store_dh0_tile_float<kK, kBV>(tid, smem_dh0, dh0_base + int64_t(kK) * VDim, VDim, state1, tCUpdate);
             if constexpr (VTile > kBV) {
-                dh0[off + kBV] = state_v1(i);
-            }
-            if constexpr (KDim > kK) {
-                dh0[off + int64_t(kK) * VDim] = state1(i);
-                if constexpr (VTile > kBV) {
-                    dh0[off + int64_t(kK) * VDim + kBV] = state1_v1(i);
-                }
+                store_dh0_tile_float<kK, kBV>(
+                    tid, smem_dh0, dh0_base + int64_t(kK) * VDim + kBV, VDim, state1_v1, tCUpdate);
             }
         }
     }
