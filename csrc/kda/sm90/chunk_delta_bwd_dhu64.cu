@@ -822,9 +822,9 @@ load_acc_64x64_bf16_from_smem(int tid, Element* smem_load, AccFrag& acc) {
     load_acc_64x32_bf16_from_smem_offset<16>(tid, smem_load + kBT * kBV, acc);
 }
 
-template <int VDim>
+template <int VDim, int HStatic = 0>
 __global__
-__launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_vtile64(
+__launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_vtile64(
     Element const* __restrict__ q,
     Element const* __restrict__ k,
     Element const* __restrict__ w,
@@ -842,15 +842,34 @@ __launch_bounds__(kThreads, 1) void chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_v
     bool has_dht,
     bool store_dh0) {
     static_assert(VDim == kV || VDim == 128);
+    static_assert(HStatic == 0 || (HStatic >= 1 && HStatic <= 64));
     (void)B;
-    (void)HArg;
-    constexpr int H = 64;
+    int const H = HStatic == 0 ? HArg : HStatic;
     constexpr int KDim = 128;
     int tid = int(threadIdx.x);
     int v_tile = int(blockIdx.x);
     int bh = int(blockIdx.y);
-    int b = bh >> 6;
-    int h = bh & 63;
+    int b;
+    int h;
+    if constexpr (HStatic == 64) {
+        b = bh >> 6;
+        h = bh & 63;
+    } else if constexpr (HStatic == 32) {
+        b = bh >> 5;
+        h = bh & 31;
+    } else if constexpr (HStatic == 16) {
+        b = bh >> 4;
+        h = bh & 15;
+    } else if constexpr (HStatic == 8) {
+        b = bh >> 3;
+        h = bh & 7;
+    } else if constexpr (HStatic == 1) {
+        b = bh;
+        h = 0;
+    } else {
+        b = bh / H;
+        h = bh - b * H;
+    }
     int v_base = v_tile * kV;
 
     auto shape_mnk = make_shape(Int<64>{}, Int<64>{}, Int<64>{});
@@ -1959,19 +1978,19 @@ ChunkGatedDeltaRuleBwdDhu64(
                 dh0.has_value());
     };
 
-    auto launch_k128_h64_vtile64 = [&]<int VDim>() {
+    auto launch_k128_vtile64 = [&]<int VDim, int HStatic = 0>() {
         static std::once_flag attr_once;
         std::call_once(attr_once, [] {
             C10_CUDA_CHECK(cudaFuncSetAttribute(
-                chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_vtile64<VDim>,
+                chunk_delta_bwd_dhu64_sm90_kernel_k128_vtile64<VDim, HStatic>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 kSmemBytesK128V64));
             C10_CUDA_CHECK(cudaFuncSetAttribute(
-                chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_vtile64<VDim>,
+                chunk_delta_bwd_dhu64_sm90_kernel_k128_vtile64<VDim, HStatic>,
                 cudaFuncAttributePreferredSharedMemoryCarveout,
                 cudaSharedmemCarveoutMaxShared));
         });
-        chunk_delta_bwd_dhu64_sm90_kernel_k128_h64_vtile64<VDim>
+        chunk_delta_bwd_dhu64_sm90_kernel_k128_vtile64<VDim, HStatic>
             <<<dim3(VDim / kV, B * H), dim3(kThreads), kSmemBytesK128V64, stream>>>(
                 reinterpret_cast<Element const*>(q.data_ptr<at::BFloat16>()),
                 reinterpret_cast<Element const*>(k.data_ptr<at::BFloat16>()),
@@ -2002,20 +2021,26 @@ ChunkGatedDeltaRuleBwdDhu64(
             launch.template operator()<64, 0, kBV, kV>();
         }
     } else {
-        if (H == 64) {
-            if (V == kV) {
-                launch_k128_h64_vtile64.template operator()<kV>();
+        if (V == 128) {
+            if (H < 32) {
+                if (H == 16) {
+                    launch.template operator()<128, 16, kBV, 128>();
+                } else if (H == 8) {
+                    launch.template operator()<128, 8, kBV, 128>();
+                } else if (H == 1) {
+                    launch.template operator()<128, 1, kBV, 128>();
+                } else {
+                    launch.template operator()<128, 0, kBV, 128>();
+                }
+            } else if (H == 64) {
+                launch_k128_vtile64.template operator()<128, 64>();
+            } else if (H == 32) {
+                launch_k128_vtile64.template operator()<128, 32>();
             } else {
-                launch_k128_h64_vtile64.template operator()<128>();
+                launch_k128_vtile64.template operator()<128, 0>();
             }
-        } else if (V == 128) {
-            if (H == 8) {
-                launch.template operator()<128, 8, kV, 128>();
-            } else if (H == 1) {
-                launch.template operator()<128, 1, kV, 128>();
-            } else {
-                launch.template operator()<128, 0, kV, 128>();
-            }
+        } else if (H == 64) {
+            launch_k128_vtile64.template operator()<kV, 64>();
         } else if (H == 8) {
             launch.template operator()<128, 8, kBV, kV>();
         } else if (H == 1) {

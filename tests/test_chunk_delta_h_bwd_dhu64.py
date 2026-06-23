@@ -106,7 +106,7 @@ def test_bwd_dhu64_h64_k128_against_fla():
     torch.testing.assert_close(our_dh0.float(), ref_dh0.float(), atol=ATOL, rtol=RTOL)
 
 
-@pytest.mark.parametrize("H", [1, 64])
+@pytest.mark.parametrize("H", [1, 8, 16, 17, 32, 64])
 def test_bwd_dhu64_k128_v128_against_fla(H: int):
     q, k, w, do, dv, h0, dht = _make_inputs(1, 128, H, 128, 128, use_h0=True, use_dht=True, seed=13)
     scale = 0.125
