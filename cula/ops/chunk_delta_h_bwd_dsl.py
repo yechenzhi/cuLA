@@ -1211,7 +1211,10 @@ class ChunkDeltaBwdDhuSm90:
         sDvPrefRaw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
         sDhBridgeRaw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
         if cutlass.const_expr(self.BV == 32):
+            sDh1BridgeRaw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
             sDv2BridgeRaw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
+        else:
+            sDh1BridgeRaw = sDhBridgeRaw
         sDh0FloatLayout = cute.make_layout((BK, self.BV), stride=(self.BV, 1))
         sDh0Float = smem.allocate_tensor(self.acc_dtype, sDh0FloatLayout, 16)
 
@@ -1338,13 +1341,12 @@ class ChunkDeltaBwdDhuSm90:
                 V * 2,
                 tidx,
             )
-            cute.arch.sync_threads()
             self._r2s_acc_store_bridge(
                 state1,
                 r2s_update,
                 r2s_update_thr,
                 sDh1Store,
-                sDhBridgeRaw.iterator,
+                sDh1BridgeRaw.iterator,
                 dh_ptr + dh_base + BK * V,
                 V * 2,
                 tidx,
