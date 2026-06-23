@@ -1105,6 +1105,96 @@ class ChunkDeltaBwdDhuSm90:
             acc[i] += vals[i]
 
     @cute.jit
+    def _prefetch_bv32(
+        self,
+        tidx: Int32,
+        q_ptr: cute.Pointer,
+        k_ptr: cute.Pointer,
+        w_ptr: cute.Pointer,
+        do_ptr: cute.Pointer,
+        dv_ptr: cute.Pointer,
+        sK0_ptr: cute.Pointer,
+        sK1_ptr: cute.Pointer,
+        sQ0_ptr: cute.Pointer,
+        sQ1_ptr: cute.Pointer,
+        sW0_ptr: cute.Pointer,
+        sW1_ptr: cute.Pointer,
+        sDo_ptr: cute.Pointer,
+        sDvPref_ptr: cute.Pointer,
+        b: Int32,
+        h: Int32,
+        H: Int32,
+        K: Int32,
+        V: Int32,
+        T: Int32,
+        v_base: Int32,
+        chunk: Int32,
+        prefetch_iter: Int32,
+    ):
+        stage = prefetch_iter % 3
+        dv_stage = prefetch_iter % 2
+        t0 = chunk * BT
+        base_k = ((b * T + t0) * H + h) * K
+        base_v = ((b * T + t0) * H + h) * V + v_base
+        k_stage_off = stage * (BT * BK)
+        v_stage_off = stage * (BT * self.BV)
+        dv_stage_off = dv_stage * (BT * self.BV)
+        k_row_stride_bytes = H * K * 2
+        v_row_stride_bytes = H * V * 2
+
+        _cp_async_k_sw128_64x64(
+            tidx,
+            (sK0_ptr + k_stage_off).toint(),
+            k_ptr + base_k,
+            k_row_stride_bytes,
+        )
+        _cp_async_k_sw128_64x64(
+            tidx,
+            (sK1_ptr + k_stage_off).toint(),
+            k_ptr + base_k + BK,
+            k_row_stride_bytes,
+        )
+        _cp_async_mn_sw128_64x64(
+            tidx,
+            (sW0_ptr + k_stage_off).toint(),
+            w_ptr + base_k,
+            k_row_stride_bytes,
+        )
+        _cp_async_mn_sw128_64x64(
+            tidx,
+            (sQ0_ptr + k_stage_off).toint(),
+            q_ptr + base_k,
+            k_row_stride_bytes,
+        )
+        cute.arch.cp_async_commit_group()
+
+        _cp_async_mn_sw128_64x64(
+            tidx,
+            (sW1_ptr + k_stage_off).toint(),
+            w_ptr + base_k + BK,
+            k_row_stride_bytes,
+        )
+        _cp_async_mn_sw128_64x64(
+            tidx,
+            (sQ1_ptr + k_stage_off).toint(),
+            q_ptr + base_k + BK,
+            k_row_stride_bytes,
+        )
+        _cp_async_mn_sw64_32x64(
+            tidx,
+            (sDo_ptr + v_stage_off).toint(),
+            do_ptr + base_v,
+            v_row_stride_bytes,
+        )
+        _cp_async_dv_bridge_64x32(
+            tidx,
+            (sDvPref_ptr + dv_stage_off).toint(),
+            dv_ptr + base_v,
+            v_row_stride_bytes,
+        )
+        cute.arch.cp_async_commit_group()
+
+    @cute.jit
     def __call__(
         self,
         q_in: cute.Tensor,
@@ -1282,17 +1372,36 @@ class ChunkDeltaBwdDhuSm90:
         dht_ptr = dht_in.iterator
 
         smem = cutlass.utils.SmemAllocator()
-        sK0Raw = smem.allocate_tensor(self.io_dtype, s_k_layout.outer, self.buffer_align_bytes)
-        sK1Raw = smem.allocate_tensor(self.io_dtype, s_k_layout.outer, self.buffer_align_bytes)
-        sQ0Raw = smem.allocate_tensor(self.io_dtype, s_qw_layout.outer, self.buffer_align_bytes)
-        sQ1Raw = smem.allocate_tensor(self.io_dtype, s_qw_layout.outer, self.buffer_align_bytes)
-        sW0Raw = smem.allocate_tensor(self.io_dtype, s_qw_layout.outer, self.buffer_align_bytes)
-        sW1Raw = smem.allocate_tensor(self.io_dtype, s_qw_layout.outer, self.buffer_align_bytes)
-        sDoRaw = smem.allocate_tensor(self.io_dtype, s_vt_layout.outer, self.buffer_align_bytes)
+        if cutlass.const_expr(self.BV == 32):
+            s_k_stage_outer = cute.append(s_k_layout.outer, cute.make_layout((3,), stride=(cute.cosize(s_k_layout.outer),)))
+            s_qw_stage_outer = cute.append(s_qw_layout.outer, cute.make_layout((3,), stride=(cute.cosize(s_qw_layout.outer),)))
+            s_vt_stage_outer = cute.append(s_vt_layout.outer, cute.make_layout((3,), stride=(cute.cosize(s_vt_layout.outer),)))
+            s_dv_pref_outer = cute.append(
+                s_state_store_layout.outer,
+                cute.make_layout((2,), stride=(cute.cosize(s_state_store_layout.outer),)),
+            )
+            sK0Raw = smem.allocate_tensor(self.io_dtype, s_k_stage_outer, self.buffer_align_bytes)
+            sK1Raw = smem.allocate_tensor(self.io_dtype, s_k_stage_outer, self.buffer_align_bytes)
+            sQ0Raw = smem.allocate_tensor(self.io_dtype, s_qw_stage_outer, self.buffer_align_bytes)
+            sQ1Raw = smem.allocate_tensor(self.io_dtype, s_qw_stage_outer, self.buffer_align_bytes)
+            sW0Raw = smem.allocate_tensor(self.io_dtype, s_qw_stage_outer, self.buffer_align_bytes)
+            sW1Raw = smem.allocate_tensor(self.io_dtype, s_qw_stage_outer, self.buffer_align_bytes)
+            sDoRaw = smem.allocate_tensor(self.io_dtype, s_vt_stage_outer, self.buffer_align_bytes)
+        else:
+            sK0Raw = smem.allocate_tensor(self.io_dtype, s_k_layout.outer, self.buffer_align_bytes)
+            sK1Raw = smem.allocate_tensor(self.io_dtype, s_k_layout.outer, self.buffer_align_bytes)
+            sQ0Raw = smem.allocate_tensor(self.io_dtype, s_qw_layout.outer, self.buffer_align_bytes)
+            sQ1Raw = smem.allocate_tensor(self.io_dtype, s_qw_layout.outer, self.buffer_align_bytes)
+            sW0Raw = smem.allocate_tensor(self.io_dtype, s_qw_layout.outer, self.buffer_align_bytes)
+            sW1Raw = smem.allocate_tensor(self.io_dtype, s_qw_layout.outer, self.buffer_align_bytes)
+            sDoRaw = smem.allocate_tensor(self.io_dtype, s_vt_layout.outer, self.buffer_align_bytes)
         sDv2Raw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
         sDh0Raw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
         sDh1Raw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
-        sDvPrefRaw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
+        if cutlass.const_expr(self.BV == 32):
+            sDvPrefRaw = smem.allocate_tensor(self.io_dtype, s_dv_pref_outer, self.buffer_align_bytes)
+        else:
+            sDvPrefRaw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
         sDhBridgeRaw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
         if cutlass.const_expr(self.BV == 32):
             sDh1BridgeRaw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
@@ -1302,27 +1411,50 @@ class ChunkDeltaBwdDhuSm90:
         sDh0FloatLayout = cute.make_layout((BK, self.BV), stride=(self.BV, 1))
         sDh0Float = smem.allocate_tensor(self.acc_dtype, sDh0FloatLayout, 16)
 
-        sK0 = cute.make_tensor(
-            cute.recast_ptr(sK0Raw.iterator, swizzle_=s_k_layout.inner, dtype=self.io_dtype), s_k_layout.outer
-        )
-        sK1 = cute.make_tensor(
-            cute.recast_ptr(sK1Raw.iterator, swizzle_=s_k_layout.inner, dtype=self.io_dtype), s_k_layout.outer
-        )
-        sQ0 = cute.make_tensor(
-            cute.recast_ptr(sQ0Raw.iterator, swizzle_=s_qw_layout.inner, dtype=self.io_dtype), s_qw_layout.outer
-        )
-        sQ1 = cute.make_tensor(
-            cute.recast_ptr(sQ1Raw.iterator, swizzle_=s_qw_layout.inner, dtype=self.io_dtype), s_qw_layout.outer
-        )
-        sW0 = cute.make_tensor(
-            cute.recast_ptr(sW0Raw.iterator, swizzle_=s_qw_layout.inner, dtype=self.io_dtype), s_qw_layout.outer
-        )
-        sW1 = cute.make_tensor(
-            cute.recast_ptr(sW1Raw.iterator, swizzle_=s_qw_layout.inner, dtype=self.io_dtype), s_qw_layout.outer
-        )
-        sDo = cute.make_tensor(
-            cute.recast_ptr(sDoRaw.iterator, swizzle_=s_vt_layout.inner, dtype=self.io_dtype), s_vt_layout.outer
-        )
+        if cutlass.const_expr(self.BV == 32):
+            sK0 = cute.make_tensor(
+                cute.recast_ptr(sK0Raw.iterator, swizzle_=s_k_layout.inner, dtype=self.io_dtype), s_k_stage_outer
+            )
+            sK1 = cute.make_tensor(
+                cute.recast_ptr(sK1Raw.iterator, swizzle_=s_k_layout.inner, dtype=self.io_dtype), s_k_stage_outer
+            )
+            sQ0 = cute.make_tensor(
+                cute.recast_ptr(sQ0Raw.iterator, swizzle_=s_qw_layout.inner, dtype=self.io_dtype), s_qw_stage_outer
+            )
+            sQ1 = cute.make_tensor(
+                cute.recast_ptr(sQ1Raw.iterator, swizzle_=s_qw_layout.inner, dtype=self.io_dtype), s_qw_stage_outer
+            )
+            sW0 = cute.make_tensor(
+                cute.recast_ptr(sW0Raw.iterator, swizzle_=s_qw_layout.inner, dtype=self.io_dtype), s_qw_stage_outer
+            )
+            sW1 = cute.make_tensor(
+                cute.recast_ptr(sW1Raw.iterator, swizzle_=s_qw_layout.inner, dtype=self.io_dtype), s_qw_stage_outer
+            )
+            sDo = cute.make_tensor(
+                cute.recast_ptr(sDoRaw.iterator, swizzle_=s_vt_layout.inner, dtype=self.io_dtype), s_vt_stage_outer
+            )
+        else:
+            sK0 = cute.make_tensor(
+                cute.recast_ptr(sK0Raw.iterator, swizzle_=s_k_layout.inner, dtype=self.io_dtype), s_k_layout.outer
+            )
+            sK1 = cute.make_tensor(
+                cute.recast_ptr(sK1Raw.iterator, swizzle_=s_k_layout.inner, dtype=self.io_dtype), s_k_layout.outer
+            )
+            sQ0 = cute.make_tensor(
+                cute.recast_ptr(sQ0Raw.iterator, swizzle_=s_qw_layout.inner, dtype=self.io_dtype), s_qw_layout.outer
+            )
+            sQ1 = cute.make_tensor(
+                cute.recast_ptr(sQ1Raw.iterator, swizzle_=s_qw_layout.inner, dtype=self.io_dtype), s_qw_layout.outer
+            )
+            sW0 = cute.make_tensor(
+                cute.recast_ptr(sW0Raw.iterator, swizzle_=s_qw_layout.inner, dtype=self.io_dtype), s_qw_layout.outer
+            )
+            sW1 = cute.make_tensor(
+                cute.recast_ptr(sW1Raw.iterator, swizzle_=s_qw_layout.inner, dtype=self.io_dtype), s_qw_layout.outer
+            )
+            sDo = cute.make_tensor(
+                cute.recast_ptr(sDoRaw.iterator, swizzle_=s_vt_layout.inner, dtype=self.io_dtype), s_vt_layout.outer
+            )
         sDv2Store = cute.make_tensor(
             cute.recast_ptr(sDv2Raw.iterator, swizzle_=s_state_store_layout.inner, dtype=self.io_dtype),
             s_state_store_layout.outer,
@@ -1374,6 +1506,37 @@ class ChunkDeltaBwdDhuSm90:
             state0.fill(0.0)
             state1.fill(0.0)
 
+        pending_groups = Int32(0)
+        if cutlass.const_expr(self.BV == 32):
+            initial_prefetch = NT if NT < 2 else Int32(2)
+            for pref in cutlass.range(initial_prefetch):
+                self._prefetch_bv32(
+                    tidx,
+                    q_ptr,
+                    k_ptr,
+                    w_ptr,
+                    do_ptr,
+                    dv_ptr,
+                    sK0Raw.iterator,
+                    sK1Raw.iterator,
+                    sQ0Raw.iterator,
+                    sQ1Raw.iterator,
+                    sW0Raw.iterator,
+                    sW1Raw.iterator,
+                    sDoRaw.iterator,
+                    sDvPrefRaw.iterator,
+                    b,
+                    h,
+                    H,
+                    K,
+                    V,
+                    T,
+                    v_base,
+                    NT - Int32(1) - pref,
+                    pref,
+                )
+                pending_groups += 2
+
         for iter_idx in cutlass.range(NT):
             chunk = NT - Int32(1) - iter_idx
             t0 = chunk * BT
@@ -1398,22 +1561,6 @@ class ChunkDeltaBwdDhuSm90:
                     v_row_stride_bytes,
                 )
                 cute.arch.cp_async_commit_group()
-            else:
-                k_row_stride_bytes = H * K * 2
-                v_row_stride_bytes = H * V * 2
-                _cp_async_k_sw128_64x64(tidx, sK0Raw.iterator.toint(), k_ptr + base_k, k_row_stride_bytes)
-                _cp_async_k_sw128_64x64(tidx, sK1Raw.iterator.toint(), k_ptr + base_k + BK, k_row_stride_bytes)
-                _cp_async_mn_sw128_64x64(tidx, sW0Raw.iterator.toint(), w_ptr + base_k, k_row_stride_bytes)
-                _cp_async_mn_sw128_64x64(tidx, sQ0Raw.iterator.toint(), q_ptr + base_k, k_row_stride_bytes)
-                cute.arch.cp_async_commit_group()
-                _cp_async_mn_sw128_64x64(tidx, sW1Raw.iterator.toint(), w_ptr + base_k + BK, k_row_stride_bytes)
-                _cp_async_mn_sw128_64x64(tidx, sQ1Raw.iterator.toint(), q_ptr + base_k + BK, k_row_stride_bytes)
-                _cp_async_mn_sw64_32x64(tidx, sDoRaw.iterator.toint(), do_ptr + base_v, v_row_stride_bytes)
-                _cp_async_dv_bridge_64x32(tidx, sDvPrefRaw.iterator.toint(), dv_ptr + base_v, v_row_stride_bytes)
-                cute.arch.cp_async_commit_group()
-            if cutlass.const_expr(self.BV == 32):
-                cute.arch.sync_threads()
-
             dh_base = (((b * NT + chunk) * H + h) * K) * V + v_base
             self._r2s_acc_store_bridge(
                 state0,
@@ -1435,12 +1582,26 @@ class ChunkDeltaBwdDhuSm90:
                 V * 2,
                 tidx,
             )
-            cute.arch.cp_async_wait_group(0)
+            if cutlass.const_expr(self.BV == 32):
+                if pending_groups >= 6:
+                    cute.arch.cp_async_wait_group(4)
+                elif pending_groups == 4:
+                    cute.arch.cp_async_wait_group(2)
+                else:
+                    cute.arch.cp_async_wait_group(0)
+                pending_groups -= 2
+            else:
+                cute.arch.cp_async_wait_group(0)
             cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.sync_threads()
 
-            tK0 = kdh_thr.partition_A(sK0)
-            tK1 = kdh_thr.partition_A(sK1)
+            if cutlass.const_expr(self.BV == 32):
+                stage = iter_idx % 3
+                tK0 = kdh_thr.partition_A(sK0[None, None, None, stage])
+                tK1 = kdh_thr.partition_A(sK1[None, None, None, stage])
+            else:
+                tK0 = kdh_thr.partition_A(sK0)
+                tK1 = kdh_thr.partition_A(sK1)
             tDh0 = kdh_thr.partition_B(sDh0Read)
             tDh1 = kdh_thr.partition_B(sDh1Read)
             tK0R = kdh_thr.make_fragment_A(tK0)
@@ -1484,7 +1645,7 @@ class ChunkDeltaBwdDhuSm90:
             else:
                 self._add_dv_bridge_64x32_from_smem(
                     acc_dv2,
-                    sDvPrefRaw.iterator,
+                    sDvPrefRaw.iterator + (iter_idx % 2) * (BT * self.BV),
                     tidx,
                 )
 
@@ -1511,11 +1672,19 @@ class ChunkDeltaBwdDhuSm90:
                     tidx,
                 )
 
-            tQ0 = update_thr.partition_A(sQ0)
-            tQ1 = update_thr.partition_A(sQ1)
-            tW0 = update_thr.partition_A(sW0)
-            tW1 = update_thr.partition_A(sW1)
-            tDo = update_thr.partition_B(sDo)
+            if cutlass.const_expr(self.BV == 32):
+                stage = iter_idx % 3
+                tQ0 = update_thr.partition_A(sQ0[None, None, None, stage])
+                tQ1 = update_thr.partition_A(sQ1[None, None, None, stage])
+                tW0 = update_thr.partition_A(sW0[None, None, None, stage])
+                tW1 = update_thr.partition_A(sW1[None, None, None, stage])
+                tDo = update_thr.partition_B(sDo[None, None, None, stage])
+            else:
+                tQ0 = update_thr.partition_A(sQ0)
+                tQ1 = update_thr.partition_A(sQ1)
+                tW0 = update_thr.partition_A(sW0)
+                tW1 = update_thr.partition_A(sW1)
+                tDo = update_thr.partition_B(sDo)
             tDv2 = update_thr.partition_B(sDv2Read)
             tQ0R = update_thr.make_fragment_A(tQ0)
             tQ1R = update_thr.make_fragment_A(tQ1)
@@ -1574,6 +1743,36 @@ class ChunkDeltaBwdDhuSm90:
             for i in cutlass.range_constexpr(cute.size(state0)):
                 state0[i] += acc_qdo0[i] * scale - acc_wdv0[i]
                 state1[i] += acc_qdo1[i] * scale - acc_wdv1[i]
+
+            if cutlass.const_expr(self.BV == 32):
+                prefetch_iter = iter_idx + 2
+                if prefetch_iter < NT:
+                    self._prefetch_bv32(
+                        tidx,
+                        q_ptr,
+                        k_ptr,
+                        w_ptr,
+                        do_ptr,
+                        dv_ptr,
+                        sK0Raw.iterator,
+                        sK1Raw.iterator,
+                        sQ0Raw.iterator,
+                        sQ1Raw.iterator,
+                        sW0Raw.iterator,
+                        sW1Raw.iterator,
+                        sDoRaw.iterator,
+                        sDvPrefRaw.iterator,
+                        b,
+                        h,
+                        H,
+                        K,
+                        V,
+                        T,
+                        v_base,
+                        NT - Int32(1) - prefetch_iter,
+                        prefetch_iter,
+                    )
+                    pending_groups += 2
 
         if store_dh0 != 0:
             dh0_base = ((b * H + h) * K) * V + v_base
