@@ -745,13 +745,16 @@ class ChunkDeltaBwdDhuSm90:
     def __init__(
         self,
         bv: int,
+        h_static: int,
         use_fast_math: bool = True,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: type[cutlass.Numeric] = cutlass.BFloat16,
     ):
         assert bv in (32, 64)
+        assert 1 <= h_static <= 64
         assert_hopper()
         self.BV = bv
+        self.H_static = h_static
         self.use_fast_math = use_fast_math
         self.acc_dtype = acc_dtype
         self.io_dtype = io_dtype
@@ -1088,8 +1091,24 @@ class ChunkDeltaBwdDhuSm90:
         v_tile, bh, _ = cute.arch.block_idx()
         B, T, H, K, V = problem_size
         NT = T // BT
-        b = bh // H
-        h = bh - b * H
+        if cutlass.const_expr(self.H_static == 64):
+            b = bh >> 6
+            h = bh & 63
+        elif cutlass.const_expr(self.H_static == 32):
+            b = bh >> 5
+            h = bh & 31
+        elif cutlass.const_expr(self.H_static == 16):
+            b = bh >> 4
+            h = bh & 15
+        elif cutlass.const_expr(self.H_static == 8):
+            b = bh >> 3
+            h = bh & 7
+        elif cutlass.const_expr(self.H_static == 1):
+            b = bh
+            h = Int32(0)
+        else:
+            b = bh // H
+            h = bh - b * H
         v_base = v_tile * self.BV
         q_ptr = q_in.iterator
         k_ptr = k_in.iterator
@@ -1409,7 +1428,7 @@ class ChunkDeltaBwdDhuSm90:
 
 
 def _compile_variant(H: int, BV: int, use_fast_math: bool):
-    kernel_obj = ChunkDeltaBwdDhuSm90(BV, use_fast_math=use_fast_math)
+    kernel_obj = ChunkDeltaBwdDhuSm90(BV, H, use_fast_math=use_fast_math)
     sym_b = cute.sym_int()
     sym_t = cute.sym_int()
 
