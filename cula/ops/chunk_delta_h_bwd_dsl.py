@@ -600,6 +600,72 @@ def _cp_async_k_sw128_64x64(
 
 
 @cutlass.dsl_user_op
+def _cp_async_mn_sw64_32x64(
+    tidx: Int32,
+    smem_base: Int32,
+    gmem_base,
+    row_stride_bytes: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    _llvm.inline_asm(
+        _T.i32(),
+        [
+            Int32(tidx).ir_value(loc=loc, ip=ip),
+            Int32(smem_base).ir_value(loc=loc, ip=ip),
+            gmem_base.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            Int32(row_stride_bytes).ir_value(loc=loc, ip=ip),
+        ],
+        """{
+        .reg .u32 t, vec, row, col, linear_bytes, swz, smem_off, s0;
+        .reg .u64 g0, row_bytes, col_bytes;
+        mov.u32 t, $1;
+
+        mov.u32 vec, t;
+        shr.u32 row, vec, 2;
+        and.b32 col, vec, 3;
+        shl.b32 col, col, 3;
+        mul.wide.u32 row_bytes, row, $4;
+        mul.wide.u32 col_bytes, col, 2;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes;
+        shl.b32 linear_bytes, row, 6;
+        shl.b32 smem_off, col, 1;
+        add.u32 linear_bytes, linear_bytes, smem_off;
+        and.b32 swz, linear_bytes, 384;
+        shr.u32 swz, swz, 3;
+        xor.b32 smem_off, linear_bytes, swz;
+        add.u32 s0, $2, smem_off;
+        cp.async.cg.shared.global.L2::128B [s0], [g0], 16;
+
+        add.u32 vec, t, 128;
+        shr.u32 row, vec, 2;
+        and.b32 col, vec, 3;
+        shl.b32 col, col, 3;
+        mul.wide.u32 row_bytes, row, $4;
+        mul.wide.u32 col_bytes, col, 2;
+        add.u64 g0, $3, row_bytes;
+        add.u64 g0, g0, col_bytes;
+        shl.b32 linear_bytes, row, 6;
+        shl.b32 smem_off, col, 1;
+        add.u32 linear_bytes, linear_bytes, smem_off;
+        and.b32 swz, linear_bytes, 384;
+        shr.u32 swz, swz, 3;
+        xor.b32 smem_off, linear_bytes, swz;
+        add.u32 s0, $2, smem_off;
+        cp.async.cg.shared.global.L2::128B [s0], [g0], 16;
+        }""",
+        "=r,r,r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cutlass.dsl_user_op
 def _cp_async_dv_bridge_64x32(
     tidx: Int32,
     smem_base: Int32,
@@ -944,6 +1010,17 @@ class ChunkDeltaBwdDhuSm90:
             acc[i + 16] += vals1[i]
 
     @cute.jit
+    def _add_dv_bridge_64x32_from_smem(
+        self,
+        acc: cute.Tensor,
+        smem_ptr: cute.Pointer,
+        tidx: Int32,
+    ):
+        vals = _load_acc_64x32_bf16_from_smem_bridge(tidx, smem_ptr.toint())
+        for i in cutlass.range_constexpr(16):
+            acc[i] += vals[i]
+
+    @cute.jit
     def __call__(
         self,
         q_in: cute.Tensor,
@@ -1131,9 +1208,10 @@ class ChunkDeltaBwdDhuSm90:
         sDv2Raw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
         sDh0Raw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
         sDh1Raw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
-        if cutlass.const_expr(self.BV == 64):
-            sDvPrefRaw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
-        sBridgeRaw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
+        sDvPrefRaw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
+        sDhBridgeRaw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
+        if cutlass.const_expr(self.BV == 32):
+            sDv2BridgeRaw = smem.allocate_tensor(self.io_dtype, s_state_store_layout.outer, self.buffer_align_bytes)
         sDh0FloatLayout = cute.make_layout((BK, self.BV), stride=(self.BV, 1))
         sDh0Float = smem.allocate_tensor(self.acc_dtype, sDh0FloatLayout, 16)
 
@@ -1183,8 +1261,6 @@ class ChunkDeltaBwdDhuSm90:
             s_state_read_layout.outer,
         )
 
-        copy_k_thr = copy_k.get_slice(tidx)
-        copy_mn_thr = copy_mn.get_slice(tidx)
         kdh_thr = kdh_mma.get_slice(tidx)
         update_thr = update_mma.get_slice(tidx)
         r2s_kdh_thr = r2s_kdh.get_slice(tidx)
@@ -1216,15 +1292,6 @@ class ChunkDeltaBwdDhuSm90:
             t0 = chunk * BT
             base_k = ((b * T + t0) * H + h) * K
             base_v = ((b * T + t0) * H + h) * V + v_base
-            base_k_aligned = cute.assume(base_k, divby=8)
-            base_v_aligned = cute.assume(base_v, divby=8)
-            gK0 = cute.make_tensor(k_ptr + base_k_aligned, cute.make_layout((BT, BK), stride=(H * K, 1)))
-            gK1 = cute.make_tensor(k_ptr + base_k_aligned + BK, cute.make_layout((BT, BK), stride=(H * K, 1)))
-            gQ0 = cute.make_tensor(q_ptr + base_k_aligned, cute.make_layout((BK, BT), stride=(1, H * K)))
-            gQ1 = cute.make_tensor(q_ptr + base_k_aligned + BK, cute.make_layout((BK, BT), stride=(1, H * K)))
-            gW0 = cute.make_tensor(w_ptr + base_k_aligned, cute.make_layout((BK, BT), stride=(1, H * K)))
-            gW1 = cute.make_tensor(w_ptr + base_k_aligned + BK, cute.make_layout((BK, BT), stride=(1, H * K)))
-            gDo = cute.make_tensor(do_ptr + base_v_aligned, cute.make_layout((self.BV, BT), stride=(1, H * V)))
 
             if cutlass.const_expr(self.BV == 64):
                 k_row_stride_bytes = H * K * 2
@@ -1245,14 +1312,20 @@ class ChunkDeltaBwdDhuSm90:
                 )
                 cute.arch.cp_async_commit_group()
             else:
-                cute.copy(copy_k, copy_k_thr.partition_S(gK0), copy_k_thr.partition_D(sK0)[None, None, None, 0])
-                cute.copy(copy_k, copy_k_thr.partition_S(gK1), copy_k_thr.partition_D(sK1)[None, None, None, 0])
-                cute.copy(copy_mn, copy_mn_thr.partition_S(gW0), copy_mn_thr.partition_D(sW0)[None, None, None, 0])
-                cute.copy(copy_mn, copy_mn_thr.partition_S(gQ0), copy_mn_thr.partition_D(sQ0)[None, None, None, 0])
-                cute.copy(copy_mn, copy_mn_thr.partition_S(gW1), copy_mn_thr.partition_D(sW1)[None, None, None, 0])
-                cute.copy(copy_mn, copy_mn_thr.partition_S(gQ1), copy_mn_thr.partition_D(sQ1)[None, None, None, 0])
-                self._copy_do_tile(gDo, sDo, tidx)
-            cute.arch.sync_threads()
+                k_row_stride_bytes = H * K * 2
+                v_row_stride_bytes = H * V * 2
+                _cp_async_k_sw128_64x64(tidx, sK0Raw.iterator.toint(), k_ptr + base_k, k_row_stride_bytes)
+                _cp_async_k_sw128_64x64(tidx, sK1Raw.iterator.toint(), k_ptr + base_k + BK, k_row_stride_bytes)
+                _cp_async_mn_sw128_64x64(tidx, sW0Raw.iterator.toint(), w_ptr + base_k, k_row_stride_bytes)
+                _cp_async_mn_sw128_64x64(tidx, sQ0Raw.iterator.toint(), q_ptr + base_k, k_row_stride_bytes)
+                cute.arch.cp_async_commit_group()
+                _cp_async_mn_sw128_64x64(tidx, sW1Raw.iterator.toint(), w_ptr + base_k + BK, k_row_stride_bytes)
+                _cp_async_mn_sw128_64x64(tidx, sQ1Raw.iterator.toint(), q_ptr + base_k + BK, k_row_stride_bytes)
+                _cp_async_mn_sw64_32x64(tidx, sDoRaw.iterator.toint(), do_ptr + base_v, v_row_stride_bytes)
+                _cp_async_dv_bridge_64x32(tidx, sDvPrefRaw.iterator.toint(), dv_ptr + base_v, v_row_stride_bytes)
+                cute.arch.cp_async_commit_group()
+            if cutlass.const_expr(self.BV == 32):
+                cute.arch.sync_threads()
 
             dh_base = (((b * NT + chunk) * H + h) * K) * V + v_base
             self._r2s_acc_store_bridge(
@@ -1260,23 +1333,23 @@ class ChunkDeltaBwdDhuSm90:
                 r2s_update,
                 r2s_update_thr,
                 sDh0Store,
-                sBridgeRaw.iterator,
+                sDhBridgeRaw.iterator,
                 dh_ptr + dh_base,
                 V * 2,
                 tidx,
             )
+            cute.arch.sync_threads()
             self._r2s_acc_store_bridge(
                 state1,
                 r2s_update,
                 r2s_update_thr,
                 sDh1Store,
-                sBridgeRaw.iterator,
+                sDhBridgeRaw.iterator,
                 dh_ptr + dh_base + BK * V,
                 V * 2,
                 tidx,
             )
-            if cutlass.const_expr(self.BV == 64):
-                cute.arch.cp_async_wait_group(0)
+            cute.arch.cp_async_wait_group(0)
             cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.sync_threads()
 
@@ -1288,8 +1361,6 @@ class ChunkDeltaBwdDhuSm90:
             tK1R = kdh_thr.make_fragment_A(tK1)
             tDh0R = kdh_thr.make_fragment_B(tDh0)
             tDh1R = kdh_thr.make_fragment_B(tDh1)
-            c_kdh = cute.make_identity_tensor((BT, self.BV))
-            tCKdh = kdh_thr.partition_C(c_kdh)
             kdh_c_shape = kdh_thr.partition_shape_C((BT, self.BV))
             acc_dv2 = kdh_thr.make_fragment_C(kdh_c_shape)
             acc_dv2.fill(0.0)
@@ -1325,12 +1396,11 @@ class ChunkDeltaBwdDhuSm90:
                     tidx,
                 )
             else:
-                for i in cutlass.range_constexpr(cute.size(acc_dv2)):
-                    coord = tCKdh[i]
-                    t_rel = coord[0]
-                    v_rel = coord[1]
-                    gDv = cute.make_tensor(dv_ptr + base_v, cute.make_layout((BT, self.BV), stride=(H * V, 1)))
-                    acc_dv2[i] += gDv[t_rel, v_rel].to(self.acc_dtype)
+                self._add_dv_bridge_64x32_from_smem(
+                    acc_dv2,
+                    sDvPrefRaw.iterator,
+                    tidx,
+                )
 
             if cutlass.const_expr(self.BV == 64):
                 self._r2s_acc_store_bridge_64x64_postbar(
@@ -1338,7 +1408,7 @@ class ChunkDeltaBwdDhuSm90:
                     r2s_kdh,
                     r2s_kdh_thr,
                     sDv2Store,
-                    sBridgeRaw.iterator,
+                    sDhBridgeRaw.iterator,
                     dv2_ptr + base_v,
                     H * V * 2,
                     tidx,
@@ -1349,7 +1419,7 @@ class ChunkDeltaBwdDhuSm90:
                     r2s_kdh,
                     r2s_kdh_thr,
                     sDv2Store,
-                    sBridgeRaw.iterator,
+                    sDv2BridgeRaw.iterator,
                     dv2_ptr + base_v,
                     H * V * 2,
                     tidx,
