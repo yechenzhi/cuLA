@@ -102,7 +102,7 @@ def run_one(args, T: int):
 
     return {
         "T": T,
-        "BV": _select_bv(args.B, args.H),
+        "BV": _select_bv(args.B, args.H, V, torch.cuda.get_device_properties(DEVICE).multi_processor_count),
         "fla_ms": fla_ms,
         "cpp_ms": cpp_ms,
         "dsl_ms": dsl_ms,

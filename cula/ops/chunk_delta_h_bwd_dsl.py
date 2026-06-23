@@ -1479,9 +1479,12 @@ def _compile_variant(H: int, BV: int, use_fast_math: bool):
     )
 
 
-def _select_bv(B: int, H: int) -> int:
-    del B
-    return 32 if H < 32 else 64
+def _select_bv(B: int, H: int, V: int = V_DIM, sm_count: int | None = None) -> int:
+    if V != V_DIM:
+        raise ValueError(f"CuTeDSL bwd_dhu requires V={V_DIM}, got V={V}")
+    if sm_count is None:
+        sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return 64 if sm_count <= B * H * (V // 64) else 32
 
 
 def _get_compiled(H: int, BV: int):
@@ -1574,7 +1577,8 @@ def chunk_gated_delta_rule_bwd_dhu(
     dv2 = torch.empty_like(dv)
     dht_arg = dht if dht is not None else torch.empty(B, H, K, V, device=q.device, dtype=torch.float32)
 
-    BV = _select_bv(B, H)
+    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    BV = _select_bv(B, H, V, sm_count)
     compiled = _get_compiled(H, BV)
     compiled(
         q,
