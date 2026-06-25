@@ -1780,6 +1780,36 @@ class ChunkDeltaBwdDhuSm90:
             acc_dv2 = kdh_thr.make_fragment_C(kdh_c_shape)
             acc_dv2.fill(0.0)
 
+            if cutlass.const_expr(self.BV == 32):
+                stage = iter_idx % 3
+                tQ0 = update_thr.partition_A(sQ0[None, None, None, stage])
+                tQ1 = update_thr.partition_A(sQ1[None, None, None, stage])
+                tW0 = update_thr.partition_A(sW0[None, None, None, stage])
+                tW1 = update_thr.partition_A(sW1[None, None, None, stage])
+                tDo = update_thr.partition_B(sDo[None, None, None, stage])
+            elif cutlass.const_expr(self.H_static < 64):
+                stage = iter_idx % 2
+                tQ0 = update_thr.partition_A(sQ0[None, None, None, stage])
+                tQ1 = update_thr.partition_A(sQ1[None, None, None, stage])
+                tW0 = update_thr.partition_A(sW0[None, None, None, stage])
+                tW1 = update_thr.partition_A(sW1[None, None, None, stage])
+                tDo = update_thr.partition_B(sDo[None, None, None, stage])
+            else:
+                tQ0 = update_thr.partition_A(sQ0)
+                tQ1 = update_thr.partition_A(sQ1)
+                tW0 = update_thr.partition_A(sW0)
+                tW1 = update_thr.partition_A(sW1)
+                tDo = update_thr.partition_B(sDo)
+            tQ0R = update_thr.make_fragment_A(tQ0)
+            tQ1R = update_thr.make_fragment_A(tQ1)
+            tW0R = update_thr.make_fragment_A(tW0)
+            tW1R = update_thr.make_fragment_A(tW1)
+            tDoR = update_thr.make_fragment_B(tDo)
+            acc_qdo0 = update_thr.make_fragment_C(update_c_shape)
+            acc_qdo1 = update_thr.make_fragment_C(update_c_shape)
+            acc_qdo0.fill(0.0)
+            acc_qdo1.fill(0.0)
+
             self._fence_acc(acc_dv2)
             cute.nvgpu.warpgroup.fence()
             self._gemm_sm90_loop(
@@ -1797,7 +1827,25 @@ class ChunkDeltaBwdDhuSm90:
                 True,
             )
             cute.nvgpu.warpgroup.commit_group()
-            cute.nvgpu.warpgroup.wait_group(0)
+            self._fence_acc(acc_qdo0)
+            self._fence_acc(acc_qdo1)
+            cute.nvgpu.warpgroup.fence()
+            self._gemm_sm90_loop(
+                update_mma,
+                tQ0R[None, None, None, 0],
+                tDoR[None, None, None, 0],
+                acc_qdo0,
+                False,
+            )
+            self._gemm_sm90_loop(
+                update_mma,
+                tQ1R[None, None, None, 0],
+                tDoR[None, None, None, 0],
+                acc_qdo1,
+                False,
+            )
+            cute.nvgpu.warpgroup.commit_group()
+            cute.nvgpu.warpgroup.wait_group(1)
             self._fence_acc(acc_dv2)
 
             if cutlass.const_expr(self.BV == 64):
@@ -1816,6 +1864,10 @@ class ChunkDeltaBwdDhuSm90:
                     sDvPrefRaw.iterator + (iter_idx % 2) * (BT * self.BV),
                     tidx,
                 )
+
+            cute.nvgpu.warpgroup.wait_group(0)
+            self._fence_acc(acc_qdo0)
+            self._fence_acc(acc_qdo1)
 
             if cutlass.const_expr(self.BV == 64):
                 self._r2s_acc_store_bridge_64x64_postbar(
@@ -1840,62 +1892,17 @@ class ChunkDeltaBwdDhuSm90:
                     tidx,
                 )
 
-            if cutlass.const_expr(self.BV == 32):
-                stage = iter_idx % 3
-                tQ0 = update_thr.partition_A(sQ0[None, None, None, stage])
-                tQ1 = update_thr.partition_A(sQ1[None, None, None, stage])
-                tW0 = update_thr.partition_A(sW0[None, None, None, stage])
-                tW1 = update_thr.partition_A(sW1[None, None, None, stage])
-                tDo = update_thr.partition_B(sDo[None, None, None, stage])
-            elif cutlass.const_expr(self.H_static < 64):
-                stage = iter_idx % 2
-                tQ0 = update_thr.partition_A(sQ0[None, None, None, stage])
-                tQ1 = update_thr.partition_A(sQ1[None, None, None, stage])
-                tW0 = update_thr.partition_A(sW0[None, None, None, stage])
-                tW1 = update_thr.partition_A(sW1[None, None, None, stage])
-                tDo = update_thr.partition_B(sDo[None, None, None, stage])
-            else:
-                tQ0 = update_thr.partition_A(sQ0)
-                tQ1 = update_thr.partition_A(sQ1)
-                tW0 = update_thr.partition_A(sW0)
-                tW1 = update_thr.partition_A(sW1)
-                tDo = update_thr.partition_B(sDo)
             tDv2 = update_thr.partition_B(sDv2Read)
-            tQ0R = update_thr.make_fragment_A(tQ0)
-            tQ1R = update_thr.make_fragment_A(tQ1)
-            tW0R = update_thr.make_fragment_A(tW0)
-            tW1R = update_thr.make_fragment_A(tW1)
-            tDoR = update_thr.make_fragment_B(tDo)
             tDv2R = update_thr.make_fragment_B(tDv2)
 
-            acc_qdo0 = update_thr.make_fragment_C(update_c_shape)
-            acc_qdo1 = update_thr.make_fragment_C(update_c_shape)
             acc_wdv0 = update_thr.make_fragment_C(update_c_shape)
             acc_wdv1 = update_thr.make_fragment_C(update_c_shape)
-            acc_qdo0.fill(0.0)
-            acc_qdo1.fill(0.0)
             acc_wdv0.fill(0.0)
             acc_wdv1.fill(0.0)
 
-            self._fence_acc(acc_qdo0)
-            self._fence_acc(acc_qdo1)
             self._fence_acc(acc_wdv0)
             self._fence_acc(acc_wdv1)
             cute.nvgpu.warpgroup.fence()
-            self._gemm_sm90_loop(
-                update_mma,
-                tQ0R[None, None, None, 0],
-                tDoR[None, None, None, 0],
-                acc_qdo0,
-                False,
-            )
-            self._gemm_sm90_loop(
-                update_mma,
-                tQ1R[None, None, None, 0],
-                tDoR[None, None, None, 0],
-                acc_qdo1,
-                False,
-            )
             self._gemm_sm90_loop(
                 update_mma,
                 tW0R[None, None, None, 0],
@@ -1912,8 +1919,6 @@ class ChunkDeltaBwdDhuSm90:
             )
             cute.nvgpu.warpgroup.commit_group()
             cute.nvgpu.warpgroup.wait_group(0)
-            self._fence_acc(acc_qdo0)
-            self._fence_acc(acc_qdo1)
             self._fence_acc(acc_wdv0)
             self._fence_acc(acc_wdv1)
 

@@ -598,6 +598,83 @@ warmup=5, iters=50):
   target the remaining H64 long-T gap or bring over the useful `feat_bwd_delta`
   structure only where it clearly helps H32 without regressing H64.
 
+### Rejected: remove WGMMA issue-time accumulator fences
+
+- Change: tested removing the `_fence_acc` calls immediately after
+  `fill(0.0)` and before WGMMA issue for `acc_dv2`, `acc_qdo*`, and `acc_wdv*`.
+  The post-`wait_group(0)` fences were kept.
+- Rationale: those MMAs start with `ACCUMULATE=False`, so the zero accumulator
+  value should not be consumed by the first WGMMA instruction. Removing the empty
+  inline-asm fences might reduce per-chunk scalar overhead.
+- Correctness: bitwise equal to the current DSL for H32/H64 with h0+dht at
+  `T=512`.
+- Result: no reliable speedup. Most results are noise-level, with small
+  regressions in H32 short/medium and H64 long-T reps.
+
+Incremental timings against the WGMMA-grouped baseline, h0+dht, `B=1,K=V=128`:
+
+| Case | Baseline ms | No issue-fence ms | Speedup |
+| --- | ---: | ---: | ---: |
+| H=32,T=4096 rep0/1/2 | 0.1742 / 0.1724 / 0.1725 | 0.1743 / 0.1726 / 0.1726 | 1.000 / 0.999 / 0.999 |
+| H=32,T=16384 rep0/1/2 | 0.6764 / 0.6810 / 0.6805 | 0.6805 / 0.6809 / 0.6803 | 0.994 / 1.000 / 1.000 |
+| H=32,T=32768 rep0/1/2 | 1.3507 / 1.3502 / 1.3486 | 1.3518 / 1.3484 / 1.3473 | 0.999 / 1.001 / 1.001 |
+| H=64,T=4096 rep0/1/2 | 0.3372 / 0.3370 / 0.3380 | 0.3372 / 0.3375 / 0.3379 | 1.000 / 0.999 / 1.000 |
+| H=64,T=16384 rep0/1/2 | 1.3281 / 1.3311 / 1.3312 | 1.3268 / 1.3302 / 1.3297 | 1.001 / 1.001 / 1.001 |
+| H=64,T=32768 rep0/1/2 | 2.6858 / 2.6817 / 2.6877 | 2.6867 / 2.6936 / 2.6821 | 1.000 / 0.996 / 1.002 |
+
+- Diagnosis: the issue-time fences are not the remaining bottleneck, or the
+  compiler scheduling they enforce is already beneficial enough to offset their
+  scalar instruction cost.
+- Decision: reject and keep the fences. Do not retry unless SASS shows a
+  concrete register/liveness improvement from deleting them.
+
+### Accepted: overlap QDO WGMMA with KDH completion
+
+- Change: moved the QDO accumulator setup and `Q @ do` WGMMA issue ahead of the
+  KDH wait. The loop now issues KDH, commits it, issues QDO in a second WGMMA
+  group, waits for only the older KDH group, finishes the `dv2` accumulator, then
+  waits for QDO before the bridge-store CTA barrier and subsequent WDV update.
+- Correctness: bitwise equal to FLA/C++ for H32/H64 with h0+dht at `T=512`;
+  `pytest -q tests/test_chunk_delta_h_bwd_dsl.py -s --tb=short` passes
+  (`34 passed`).
+- Result: stable small speedup over the WGMMA-grouped baseline. H32 benefits
+  most; H64 short T benefits, while long T is near noise because store/update
+  throughput dominates.
+
+Incremental timings against the WGMMA-grouped baseline, h0+dht, `B=1,K=V=128`:
+
+| Case | Baseline ms | QDO-overlap ms | Speedup |
+| --- | ---: | ---: | ---: |
+| H=32,T=4096 rep0/1/2 | 0.1732 / 0.1728 / 0.1725 | 0.1716 / 0.1712 / 0.1708 | 1.009 / 1.009 / 1.010 |
+| H=32,T=16384 rep0/1/2 | 0.6792 / 0.6800 / 0.6805 | 0.6730 / 0.6739 / 0.6738 | 1.009 / 1.009 / 1.010 |
+| H=32,T=32768 rep0/1/2 | 1.3563 / 1.3548 / 1.3518 | 1.3473 / 1.3385 / 1.3458 | 1.007 / 1.012 / 1.004 |
+| H=64,T=4096 rep0/1/2 | 0.3348 / 0.3342 / 0.3345 | 0.3324 / 0.3339 / 0.3329 | 1.007 / 1.001 / 1.005 |
+| H=64,T=16384 rep0/1/2 | 1.3315 / 1.3299 / 1.3291 | 1.3221 / 1.3221 / 1.3231 | 1.007 / 1.006 / 1.005 |
+| H=64,T=32768 rep0/1/2 | 2.6900 / 2.6810 / 2.6806 | 2.6668 / 2.6765 / 2.6635 | 1.009 / 1.002 / 1.006 |
+
+Benchmark script result after the change (`benchmarks/bench_chunk_delta_h_bwd_dsl.py`,
+warmup=5, iters=50):
+
+| Case | FLA ms | C++ ms | DSL ms | C++/DSL |
+| --- | ---: | ---: | ---: | ---: |
+| H=32,T=4096 | 0.2054 | 0.1789 | 0.1750 | 1.022 |
+| H=32,T=16384 | 0.7756 | 0.6714 | 0.6507 | 1.032 |
+| H=32,T=32768 | 1.5362 | 1.3719 | 1.3425 | 1.022 |
+| H=64,T=4096 | 0.3790 | 0.3556 | 0.3337 | 1.065 |
+| H=64,T=16384 | 1.5108 | 1.3207 | 1.3177 | 1.002 |
+| H=64,T=32768 | 3.0093 | 2.6327 | 2.6677 | 0.987 |
+
+- Diagnosis:
+  - The existing bridge-store path has a CTA barrier, so QDO cannot remain
+    outstanding across the store. It can still be issued early enough to overlap
+    part of the KDH wait/update window.
+  - This is a local improvement to the current cp.async/bridge-store baseline,
+    not a replacement for the TMA path.
+- Decision: keep the overlap schedule in the public DSL kernel. Do not interpret
+  the inline asm in this baseline as abandoning TMA. The TMA attribution results
+  only reject small load/store substitutions; a clean producer/consumer
+  warp-specialized TMA kernel remains the next TMA-first direction.
+
 ## Current Target
 
 Optimize the current CuTeDSL kernel directly. For `B=1,H=32,K=V=128`, profiling
