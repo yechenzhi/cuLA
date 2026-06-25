@@ -1020,26 +1020,20 @@ class ChunkDeltaBwdDhuSm90:
         cute.copy(r2s, r2s.retile(bf16), r2s_thr.partition_D(sTile)[None, None, None, 0])
 
         smem_base = bridge_ptr.toint()
-        _store_bridge_64x32_bf16(
-            tidx,
-            smem_base,
-            gmem_ptr,
-            row_stride_bytes,
-            _pack_bf16x2_f32(acc[0], acc[1]),
-            _pack_bf16x2_f32(acc[2], acc[3]),
-            _pack_bf16x2_f32(acc[4], acc[5]),
-            _pack_bf16x2_f32(acc[6], acc[7]),
-            _pack_bf16x2_f32(acc[8], acc[9]),
-            _pack_bf16x2_f32(acc[10], acc[11]),
-            _pack_bf16x2_f32(acc[12], acc[13]),
-            _pack_bf16x2_f32(acc[14], acc[15]),
-        )
         if cutlass.const_expr(self.BV == 64):
-            _store_bridge_64x32_bf16(
+            _store_bridge_64x64_postbar_bf16(
                 tidx,
-                smem_base + BT * 32 * 2,
-                gmem_ptr + 32,
+                smem_base,
+                gmem_ptr,
                 row_stride_bytes,
+                _pack_bf16x2_f32(acc[0], acc[1]),
+                _pack_bf16x2_f32(acc[2], acc[3]),
+                _pack_bf16x2_f32(acc[4], acc[5]),
+                _pack_bf16x2_f32(acc[6], acc[7]),
+                _pack_bf16x2_f32(acc[8], acc[9]),
+                _pack_bf16x2_f32(acc[10], acc[11]),
+                _pack_bf16x2_f32(acc[12], acc[13]),
+                _pack_bf16x2_f32(acc[14], acc[15]),
                 _pack_bf16x2_f32(acc[16], acc[17]),
                 _pack_bf16x2_f32(acc[18], acc[19]),
                 _pack_bf16x2_f32(acc[20], acc[21]),
@@ -1048,6 +1042,21 @@ class ChunkDeltaBwdDhuSm90:
                 _pack_bf16x2_f32(acc[26], acc[27]),
                 _pack_bf16x2_f32(acc[28], acc[29]),
                 _pack_bf16x2_f32(acc[30], acc[31]),
+            )
+        else:
+            _store_bridge_64x32_bf16(
+                tidx,
+                smem_base,
+                gmem_ptr,
+                row_stride_bytes,
+                _pack_bf16x2_f32(acc[0], acc[1]),
+                _pack_bf16x2_f32(acc[2], acc[3]),
+                _pack_bf16x2_f32(acc[4], acc[5]),
+                _pack_bf16x2_f32(acc[6], acc[7]),
+                _pack_bf16x2_f32(acc[8], acc[9]),
+                _pack_bf16x2_f32(acc[10], acc[11]),
+                _pack_bf16x2_f32(acc[12], acc[13]),
+                _pack_bf16x2_f32(acc[14], acc[15]),
             )
 
     @cute.jit
