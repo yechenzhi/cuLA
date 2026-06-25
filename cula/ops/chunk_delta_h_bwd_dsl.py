@@ -1789,11 +1789,6 @@ class ChunkDeltaBwdDhuSm90:
                 acc_dv2,
                 False,
             )
-            cute.nvgpu.warpgroup.commit_group()
-            cute.nvgpu.warpgroup.wait_group(0)
-            self._fence_acc(acc_dv2)
-
-            cute.nvgpu.warpgroup.fence()
             self._gemm_sm90_loop(
                 kdh_mma,
                 tK1R[None, None, None, 0],
@@ -1884,6 +1879,8 @@ class ChunkDeltaBwdDhuSm90:
 
             self._fence_acc(acc_qdo0)
             self._fence_acc(acc_qdo1)
+            self._fence_acc(acc_wdv0)
+            self._fence_acc(acc_wdv1)
             cute.nvgpu.warpgroup.fence()
             self._gemm_sm90_loop(
                 update_mma,
@@ -1899,14 +1896,6 @@ class ChunkDeltaBwdDhuSm90:
                 acc_qdo1,
                 False,
             )
-            cute.nvgpu.warpgroup.commit_group()
-            cute.nvgpu.warpgroup.wait_group(0)
-            self._fence_acc(acc_qdo0)
-            self._fence_acc(acc_qdo1)
-
-            self._fence_acc(acc_wdv0)
-            self._fence_acc(acc_wdv1)
-            cute.nvgpu.warpgroup.fence()
             self._gemm_sm90_loop(
                 update_mma,
                 tW0R[None, None, None, 0],
@@ -1923,6 +1912,8 @@ class ChunkDeltaBwdDhuSm90:
             )
             cute.nvgpu.warpgroup.commit_group()
             cute.nvgpu.warpgroup.wait_group(0)
+            self._fence_acc(acc_qdo0)
+            self._fence_acc(acc_qdo1)
             self._fence_acc(acc_wdv0)
             self._fence_acc(acc_wdv1)
 
